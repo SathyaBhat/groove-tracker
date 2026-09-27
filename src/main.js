@@ -113,7 +113,10 @@ const state = {
   genre: "All genres",
   syncFrequency: "Weekly",
   toast: "",
-  history: JSON.parse(localStorage.getItem("groove-history") || "[]")
+  history: JSON.parse(localStorage.getItem("groove-history") || "[]"),
+  apiAvailable: false,
+  discogs: { connected: false, username: null },
+  remoteListenId: null
 };
 
 const app = document.querySelector("#app");
@@ -128,13 +131,88 @@ function timeGreeting() {
 }
 
 function sideDuration(album, index) {
-  const [minutes, seconds] = album.sides[index].length.split(":").map(Number);
-  return minutes * 60 + seconds;
+  const [minutes, seconds] = (album.sides[index]?.length || "").split(":").map(Number);
+  return Number.isFinite(minutes) && Number.isFinite(seconds) ? minutes * 60 + seconds : 0;
 }
 
 function formatDuration(seconds) {
   const minutes = Math.floor(seconds / 60);
   return `${minutes} min`;
+}
+
+function formatSideLength(seconds) {
+  if (!seconds) return "—";
+  const minutes = Math.floor(seconds / 60);
+  const remainder = String(seconds % 60).padStart(2, "0");
+  return `${minutes}:${remainder}`;
+}
+
+function asUiAlbum(record) {
+  const sides = record.sides?.length
+    ? record.sides.map(side => ({
+        name: `Side ${side.side}`,
+        length: formatSideLength(side.durationSeconds),
+        tracks: side.tracks.map(track => track.title)
+      }))
+    : [
+        { name: "Side A", length: "—", tracks: ["Select this record to load its tracklist"] },
+        { name: "Side B", length: "—", tracks: ["Track details will come from Discogs"] }
+      ];
+
+  return {
+    id: record.id,
+    serverId: record.id,
+    artist: record.artist,
+    title: record.title,
+    year: record.year || "—",
+    genre: record.styles?.[0] || record.genres?.[0] || "Vinyl",
+    format: record.format || "Vinyl",
+    cover: record.coverUrl || albums[0].cover,
+    colors: ["#23352e", "#df9f47"],
+    sides
+  };
+}
+
+async function checkApi() {
+  try {
+    const [integrationResponse, collectionResponse] = await Promise.all([
+      fetch("/api/integrations/discogs"),
+      fetch("/api/collection")
+    ]);
+    if (!integrationResponse.ok || !collectionResponse.ok) return;
+
+    state.apiAvailable = true;
+    state.discogs = await integrationResponse.json();
+    const { records } = await collectionResponse.json();
+    if (records?.length) {
+      const syncedAlbums = records.map(asUiAlbum);
+      albums.splice(0, albums.length, ...syncedAlbums);
+      state.selected = syncedAlbums[0];
+      void hydrateSelectedRecord(syncedAlbums[0].serverId);
+    }
+    render();
+  } catch {
+    // The interface remains fully usable with sample data before the API is configured.
+  }
+}
+
+async function hydrateSelectedRecord(serverId) {
+  try {
+    const response = await fetch(`/api/collection/${serverId}`);
+    if (!response.ok) return;
+    const { record } = await response.json();
+    if (!record) return;
+    const hydrated = asUiAlbum(record);
+    const index = albums.findIndex(album => String(album.id) === String(serverId));
+    if (index >= 0) albums[index] = hydrated;
+    if (String(state.selected.id) === String(serverId)) {
+      state.selected = hydrated;
+      state.selectedSide = 0;
+      render();
+    }
+  } catch {
+    // A collection card still works with its cached summary if release details cannot load.
+  }
 }
 
 function albumCard(album) {
@@ -296,10 +374,13 @@ function statsPage() {
 }
 
 function settingsPage() {
+  const discogsConnection = state.discogs.connected
+    ? `<p>Collection connected as <strong>${state.discogs.username}</strong></p><span class="connected">${icon("check")}Connected</span>`
+    : `<p>Connect your collection to bring your records into Groove Tracker.</p><button class="connect-button" data-action="discogs-connect">Connect Discogs ${icon("arrow")}</button>`;
   return layout(`<div class="page settings-page">
     <header class="page-head"><div><p class="eyebrow">Your setup</p><h1>Settings</h1></div></header>
     <section class="settings-stack">
-      <article class="settings-card"><div class="service-mark discogs">d</div><div><h2>Discogs</h2><p>Collection connected as <strong>sathyabhat</strong></p></div><span class="connected">${icon("check")}Connected</span></article>
+      <article class="settings-card"><div class="service-mark discogs">d</div><div><h2>Discogs</h2>${discogsConnection}</div></article>
       <article class="settings-card"><div class="service-mark lastfm">lfm</div><div><h2>Last.fm</h2><p>Scrobble every track as a side is recorded.</p></div><span class="connected">${icon("check")}Connected</span></article>
       <article class="settings-card frequency-card"><div><h2>Collection refresh</h2><p>Keep your Discogs collection up to date in the background.</p></div><label><span>Refresh</span><select data-input="frequency">${["Daily", "Weekly", "Monthly"].map(freq => `<option ${freq === state.syncFrequency ? "selected" : ""}>${freq}</option>`).join("")}</select></label></article>
       <article class="settings-card"><div><h2>Listening notifications</h2><p>A nudge when it’s time to flip the record.</p></div><button class="toggle on" aria-label="Toggle notifications"><i></i></button></article>
@@ -315,10 +396,11 @@ function render() {
 }
 
 function selectAlbum(id, navigate = false) {
-  state.selected = albums.find(album => album.id === Number(id)) || albums[0];
+  state.selected = albums.find(album => String(album.id) === String(id)) || albums[0];
   state.selectedSide = 0;
   if (navigate) state.page = "home";
   render();
+  if (state.selected.serverId) void hydrateSelectedRecord(state.selected.serverId);
 }
 
 function attachEvents() {
@@ -331,7 +413,7 @@ function attachEvents() {
     state.selectedSide = Number(button.dataset.side);
     render();
   }));
-  document.querySelectorAll("[data-action]").forEach(button => button.addEventListener("click", () => {
+  document.querySelectorAll("[data-action]").forEach(button => button.addEventListener("click", async () => {
     if (button.dataset.action === "track") {
       state.isPlaying = !state.isPlaying;
       if (state.isPlaying) {
@@ -339,18 +421,50 @@ function attachEvents() {
         state.history.unshift({ album: state.selected, side: state.selectedSide, startedAt: `Today, ${now}` });
         localStorage.setItem("groove-history", JSON.stringify(state.history));
         state.toast = `${state.selected.sides[state.selectedSide].name} is now being tracked`;
+        if (state.selected.serverId) {
+          const side = state.selected.sides[state.selectedSide].name.replace("Side ", "");
+          fetch("/api/listens", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ collectionReleaseId: state.selected.serverId, side })
+          })
+            .then(response => response.ok ? response.json() : Promise.reject(new Error("Unable to save listen")))
+            .then(({ listen }) => { state.remoteListenId = listen.id; })
+            .catch(() => {
+              state.toast = "Tracking locally — the server could not save this listen.";
+              render();
+            });
+        }
       } else {
         state.toast = "Tracking stopped — the play has been saved";
+        if (state.remoteListenId) {
+          fetch(`/api/listens/${state.remoteListenId}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ status: "stopped" })
+          }).catch(() => {});
+          state.remoteListenId = null;
+        }
       }
       render();
     }
     if (button.dataset.action === "sync") {
       button.classList.add("syncing");
       button.querySelector("span:last-child")?.replaceChildren(document.createTextNode("Syncing…"));
-      setTimeout(() => {
-        state.toast = "Collection is up to date";
-        render();
-      }, 800);
+      try {
+        if (!state.apiAvailable || !state.discogs.connected) throw new Error("Connect Discogs first.");
+        const response = await fetch("/api/collection/sync", { method: "POST" });
+        if (!response.ok) throw new Error("Collection sync failed.");
+        const result = await response.json();
+        state.toast = `${result.releasesSeen} records synced from Discogs`;
+        await checkApi();
+      } catch (error) {
+        state.toast = error.message;
+      }
+      render();
+    }
+    if (button.dataset.action === "discogs-connect") {
+      window.location.assign("/api/integrations/discogs/start");
     }
     if (button.dataset.action === "sort") {
       state.toast = "Sorted by recently added";
@@ -374,11 +488,19 @@ function attachEvents() {
     state.syncFrequency = event.target.value;
     state.toast = `Collection refresh set to ${state.syncFrequency.toLowerCase()}`;
     render();
+    if (state.apiAvailable) {
+      fetch("/api/settings/sync-frequency", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ frequency: state.syncFrequency.toLowerCase() })
+      }).catch(() => {});
+    }
   });
   document.querySelector(".toggle")?.addEventListener("click", event => event.currentTarget.classList.toggle("on"));
 }
 
 render();
+checkApi();
 
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => {}));
