@@ -110,7 +110,7 @@ export async function syncCollection(userId) {
        VALUES ($1, now(), now() + interval '1 week', now())
        ON CONFLICT (user_id) DO UPDATE SET
          last_synced_at = now(),
-         next_sync_at = CASE frequency
+         next_sync_at = CASE sync_settings.frequency
            WHEN 'daily' THEN now() + interval '1 day'
            WHEN 'monthly' THEN now() + interval '1 month'
            ELSE now() + interval '1 week'
@@ -154,7 +154,7 @@ export async function hydrateRelease(userId, collectionReleaseId) {
      SET tracklist = $3, tracklist_fetched_at = now(), updated_at = now()
      WHERE id = $1 AND user_id = $2
      RETURNING *`,
-    [collectionReleaseId, userId, detail.tracklist || []]
+    [collectionReleaseId, userId, JSON.stringify(detail.tracklist || [])]
   );
   return updated.rows[0];
 }
