@@ -2,7 +2,8 @@ import crypto from "node:crypto";
 import "dotenv/config";
 
 const DISCOGS_API = "https://api.discogs.com";
-const DISCOGS_OAUTH = "https://www.discogs.com/oauth";
+const DISCOGS_OAUTH_API = `${DISCOGS_API}/oauth`;
+const DISCOGS_AUTHORIZE = "https://www.discogs.com/oauth/authorize";
 
 function encode(value) {
   return encodeURIComponent(value).replace(/[!'()*]/g, character =>
@@ -57,7 +58,9 @@ async function discogsFetch(url, { method = "GET", token, tokenSecret, callback,
     method,
     headers: {
       Authorization: oauthHeader({ method, url, token, tokenSecret, callback, verifier }),
-      "User-Agent": "GrooveTracker/0.1"
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/json",
+      "User-Agent": process.env.DISCOGS_USER_AGENT || "GrooveTracker/0.1"
     }
   });
   if (!response.ok) {
@@ -67,15 +70,15 @@ async function discogsFetch(url, { method = "GET", token, tokenSecret, callback,
 }
 
 export async function createRequestToken(callbackUrl) {
-  const response = await discogsFetch(`${DISCOGS_OAUTH}/request_token`, {
-    method: "POST",
+  const response = await discogsFetch(`${DISCOGS_OAUTH_API}/request_token`, {
+    method: "GET",
     callback: callbackUrl
   });
   return parseResponse(await response.text());
 }
 
 export async function exchangeAccessToken({ requestToken, requestTokenSecret, verifier }) {
-  const response = await discogsFetch(`${DISCOGS_OAUTH}/access_token`, {
+  const response = await discogsFetch(`${DISCOGS_OAUTH_API}/access_token`, {
     method: "POST",
     token: requestToken,
     tokenSecret: requestTokenSecret,
@@ -85,7 +88,7 @@ export async function exchangeAccessToken({ requestToken, requestTokenSecret, ve
 }
 
 export function authorizationUrl(requestToken) {
-  return `${DISCOGS_OAUTH}/authorize?oauth_token=${encode(requestToken)}`;
+  return `${DISCOGS_AUTHORIZE}?oauth_token=${encode(requestToken)}`;
 }
 
 export async function getIdentity(credentials) {

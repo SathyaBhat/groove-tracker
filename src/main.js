@@ -120,6 +120,14 @@ const state = {
 };
 
 const app = document.querySelector("#app");
+const discogsResult = new URLSearchParams(window.location.search).get("discogs");
+
+if (discogsResult) {
+  state.toast = discogsResult === "connected"
+    ? "Discogs connected — sync your collection when you’re ready."
+    : "Discogs connection was cancelled.";
+  window.history.replaceState({}, "", window.location.pathname);
+}
 
 function icon(name) {
   return `<span class="icon icon-${name}">${icons[name]}</span>`;
@@ -176,8 +184,8 @@ function asUiAlbum(record) {
 async function checkApi() {
   try {
     const [integrationResponse, collectionResponse] = await Promise.all([
-      fetch("/api/integrations/discogs"),
-      fetch("/api/collection")
+      fetch("api/integrations/discogs"),
+      fetch("api/collection")
     ]);
     if (!integrationResponse.ok || !collectionResponse.ok) return;
 
@@ -198,7 +206,7 @@ async function checkApi() {
 
 async function hydrateSelectedRecord(serverId) {
   try {
-    const response = await fetch(`/api/collection/${serverId}`);
+    const response = await fetch(`api/collection/${serverId}`);
     if (!response.ok) return;
     const { record } = await response.json();
     if (!record) return;
@@ -423,7 +431,7 @@ function attachEvents() {
         state.toast = `${state.selected.sides[state.selectedSide].name} is now being tracked`;
         if (state.selected.serverId) {
           const side = state.selected.sides[state.selectedSide].name.replace("Side ", "");
-          fetch("/api/listens", {
+          fetch("api/listens", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ collectionReleaseId: state.selected.serverId, side })
@@ -438,7 +446,7 @@ function attachEvents() {
       } else {
         state.toast = "Tracking stopped — the play has been saved";
         if (state.remoteListenId) {
-          fetch(`/api/listens/${state.remoteListenId}`, {
+          fetch(`api/listens/${state.remoteListenId}`, {
             method: "PATCH",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ status: "stopped" })
@@ -453,7 +461,7 @@ function attachEvents() {
       button.querySelector("span:last-child")?.replaceChildren(document.createTextNode("Syncing…"));
       try {
         if (!state.apiAvailable || !state.discogs.connected) throw new Error("Connect Discogs first.");
-        const response = await fetch("/api/collection/sync", { method: "POST" });
+        const response = await fetch("api/collection/sync", { method: "POST" });
         if (!response.ok) throw new Error("Collection sync failed.");
         const result = await response.json();
         state.toast = `${result.releasesSeen} records synced from Discogs`;
@@ -464,7 +472,7 @@ function attachEvents() {
       render();
     }
     if (button.dataset.action === "discogs-connect") {
-      window.location.assign("/api/integrations/discogs/start");
+      window.location.assign("api/integrations/discogs/start");
     }
     if (button.dataset.action === "sort") {
       state.toast = "Sorted by recently added";
@@ -489,7 +497,7 @@ function attachEvents() {
     state.toast = `Collection refresh set to ${state.syncFrequency.toLowerCase()}`;
     render();
     if (state.apiAvailable) {
-      fetch("/api/settings/sync-frequency", {
+      fetch("api/settings/sync-frequency", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ frequency: state.syncFrequency.toLowerCase() })
@@ -503,5 +511,5 @@ render();
 checkApi();
 
 if ("serviceWorker" in navigator) {
-  window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => {}));
+  window.addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => {}));
 }

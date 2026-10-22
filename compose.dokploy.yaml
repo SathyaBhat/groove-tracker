@@ -1,0 +1,106 @@
+# Deployed by Dokploy (compose path: compose.dokploy.yaml). compose.yaml stays the local dev stack.
+# GROOVE_LAN_HOST and GROOVE_TAILNET_HOST come from the Dokploy app's environment, so no hostnames
+# are committed here. The LAN host serves the app at /; the tailnet host serves it under /groove
+# (Traefik strips the prefix). The PWA and the API share each host: Traefik sends /api to the API.
+x-app-environment: &app-environment
+  DATABASE_URL: postgresql://groove:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@db:5432/groove_tracker
+  # Same origin as the PWA, over HTTPS: the Discogs OAuth callback is derived from API_ORIGIN.
+  APP_ORIGIN: https://${GROOVE_TAILNET_HOST:?set GROOVE_TAILNET_HOST}/groove
+  API_ORIGIN: https://${GROOVE_TAILNET_HOST}/groove
+  PORT: "3001"
+  DISCOGS_CONSUMER_KEY: ${DISCOGS_CONSUMER_KEY:-}
+  DISCOGS_CONSUMER_SECRET: ${DISCOGS_CONSUMER_SECRET:-}
+  DISCOGS_USER_AGENT: ${DISCOGS_USER_AGENT:-GrooveTracker/0.1}
+  TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:?set TOKEN_ENCRYPTION_KEY}
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: groove-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: groove_tracker
+      POSTGRES_USER: groove
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U groove -d groove_tracker"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    container_name: groove-api
+    restart: unless-stopped
+    command: sh -c "npm run db:migrate && npm run api:start"
+    environment: *app-environment
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - default
+      - dokploy-network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=dokploy-network"
+      - "traefik.http.routers.groove-api.rule=Host(`${GROOVE_LAN_HOST}`) && PathPrefix(`/api`)"
+      - "traefik.http.routers.groove-api.entrypoints=web"
+      - "traefik.http.routers.groove-api.priority=100"
+      - "traefik.http.routers.groove-api.service=groove-api"
+      - "traefik.http.routers.groove-api-secure.rule=Host(`${GROOVE_TAILNET_HOST}`) && PathPrefix(`/groove/api`)"
+      - "traefik.http.routers.groove-api-secure.entrypoints=websecure"
+      - "traefik.http.routers.groove-api-secure.tls=true"
+      - "traefik.http.routers.groove-api-secure.tls.certresolver=tailscale"
+      - "traefik.http.routers.groove-api-secure.priority=100"
+      - "traefik.http.routers.groove-api-secure.middlewares=groove-strip"
+      - "traefik.http.routers.groove-api-secure.service=groove-api"
+      - "traefik.http.services.groove-api.loadbalancer.server.port=3001"
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    container_name: groove-web
+    restart: unless-stopped
+    networks:
+      - dokploy-network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.groove.rule=Host(`${GROOVE_LAN_HOST}`)"
+      - "traefik.http.routers.groove.entrypoints=web"
+      - "traefik.http.routers.groove.service=groove"
+      - "traefik.http.routers.groove-secure.rule=Host(`${GROOVE_TAILNET_HOST}`) && PathPrefix(`/groove`)"
+      - "traefik.http.routers.groove-secure.entrypoints=websecure"
+      - "traefik.http.routers.groove-secure.tls=true"
+      - "traefik.http.routers.groove-secure.tls.certresolver=tailscale"
+      - "traefik.http.routers.groove-secure.tls.domains[0].main=${GROOVE_TAILNET_HOST}"
+      - "traefik.http.routers.groove-secure.middlewares=groove-slash,groove-strip"
+      - "traefik.http.routers.groove-secure.service=groove"
+      # The app uses relative URLs, so /groove must become /groove/.
+      - "traefik.http.middlewares.groove-slash.redirectregex.regex=^(https://[^/]+)/groove$$"
+      - "traefik.http.middlewares.groove-slash.redirectregex.replacement=$${1}/groove/"
+      - "traefik.http.middlewares.groove-strip.stripprefix.prefixes=/groove"
+      - "traefik.http.services.groove.loadbalancer.server.port=80"
+
+  worker:
+    build: .
+    container_name: groove-worker
+    restart: unless-stopped
+    command: sh -c "while true; do npm run worker:sync; sleep 3600; done"
+    environment: *app-environment
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - default
+
+volumes:
+  postgres-data:
+
+networks:
+  dokploy-network:
+    external: true

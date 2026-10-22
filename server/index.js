@@ -21,7 +21,7 @@ const app = Fastify({ logger: true });
 const appOrigin = process.env.APP_ORIGIN || "http://localhost:5173";
 const apiOrigin = process.env.API_ORIGIN || "http://localhost:3001";
 
-await app.register(cors, { origin: appOrigin });
+await app.register(cors, { origin: new URL(appOrigin).origin });
 
 function nextSyncAt(frequency) {
   const next = new Date();

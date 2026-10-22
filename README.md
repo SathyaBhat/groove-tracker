@@ -23,7 +23,7 @@ npm run dev
 ## Run the API locally
 
 1. Create a PostgreSQL database named `groove_tracker`.
-2. Copy `.env.example` to `.env`, then provide the database URL, Discogs application credentials, and a 32-byte encryption key.
+2. Copy `.env.example` to `.env`, then provide the database URL, Discogs application credentials, a descriptive `DISCOGS_USER_AGENT`, and a 32-byte encryption key.
 3. Create a Discogs application and set its callback URL to:
 
    ```text
@@ -55,6 +55,22 @@ The PWA is available at `localhost:5173`, the API at `localhost:3001`, and Postg
 ```sh
 docker compose down -v
 ```
+
+## Deploy with Dokploy
+
+`compose.dokploy.yaml` is the production stack: PostgreSQL (internal only), the API (runs migrations on start), an nginx-served PWA build (`Dockerfile.web`), and the hourly sync worker. Traefik routes `/api` to the API and everything else to the PWA, so the app stays same-origin. The LAN host serves it at `/`; the tailnet host serves it under `/groove` (the frontend uses relative URLs so one build works for both).
+
+In Dokploy, create a Compose app from this repo, set the compose path to `compose.dokploy.yaml`, and set these environment variables:
+
+| Variable | Purpose |
+| --- | --- |
+| `GROOVE_TAILNET_HOST` | HTTPS host (Tailscale cert resolver), served at `/groove`. Also used for `APP_ORIGIN` and `API_ORIGIN`; PWA install needs HTTPS. |
+| `GROOVE_LAN_HOST` | Plain-HTTP host for the LAN. |
+| `POSTGRES_PASSWORD` | Database password. |
+| `TOKEN_ENCRYPTION_KEY` | `openssl rand -base64 32`. |
+| `DISCOGS_CONSUMER_KEY`, `DISCOGS_CONSUMER_SECRET` | From your Discogs developer app. |
+
+The stack joins the external `dokploy-network` and expects a Traefik `tailscale` cert resolver. The Discogs callback is `https://<GROOVE_TAILNET_HOST>/groove/api/integrations/discogs/callback`.
 
 ## API capabilities
 

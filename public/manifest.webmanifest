@@ -2,13 +2,13 @@
   "name": "Groove Tracker — Vinyl listening, remembered",
   "short_name": "Groove Tracker",
   "description": "Track the records you play and keep your listening history close.",
-  "start_url": "/",
+  "start_url": "./",
   "display": "standalone",
   "background_color": "#f5f4ef",
   "theme_color": "#f5f4ef",
   "icons": [
     {
-      "src": "/favicon.svg",
+      "src": "favicon.svg",
       "sizes": "any",
       "type": "image/svg+xml",
       "purpose": "any"
