@@ -4,10 +4,14 @@ import { fileURLToPath } from "node:url";
 import { db } from "./db.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const migration = await fs.readFile(path.join(here, "migrations", "001_initial.sql"), "utf8");
+const migrationsDir = path.join(here, "migrations");
+const files = (await fs.readdir(migrationsDir)).filter(file => file.endsWith(".sql")).sort();
 
 try {
-  await db.query(migration);
+  // Every migration is safe to run again, so apply them all in order on each start.
+  for (const file of files) {
+    await db.query(await fs.readFile(path.join(migrationsDir, file), "utf8"));
+  }
   console.log("Database schema is up to date.");
 } finally {
   await db.end();
