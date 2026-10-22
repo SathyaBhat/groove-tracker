@@ -34,8 +34,15 @@ export function sideForTrack(track) {
   return match?.[1]?.toUpperCase() || null;
 }
 
-export function tracksForSide(tracklist, side) {
+// Discogs nests the tracks of classical or multi-part releases under an index entry (sub_tracks).
+function flattenTracklist(tracklist) {
   return (tracklist || [])
+    .flatMap(track => (track.sub_tracks?.length ? track.sub_tracks : [track]))
+    .filter(track => track.type_ !== "heading");
+}
+
+export function tracksForSide(tracklist, side) {
+  return flattenTracklist(tracklist)
     .filter(track => sideForTrack(track) === side)
     .map(track => ({
       title: track.title,

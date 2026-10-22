@@ -115,6 +115,7 @@ const state = {
   toast: "",
   history: JSON.parse(localStorage.getItem("groove-history") || "[]"),
   apiAvailable: false,
+  stats: null,
   discogs: { connected: false, username: null },
   remoteListenId: null
 };
@@ -153,6 +154,101 @@ function formatSideLength(seconds) {
   const minutes = Math.floor(seconds / 60);
   const remainder = String(seconds % 60).padStart(2, "0");
   return `${minutes}:${remainder}`;
+}
+
+function formatHours(seconds) {
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.round((seconds % 3600) / 60);
+  if (!hours) return `${minutes}m`;
+  return `${hours}h ${String(minutes).padStart(2, "0")}m`;
+}
+
+function dayKey(date) {
+  const pad = number => String(number).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+function formatWhen(iso) {
+  const date = new Date(iso);
+  const time = date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const days = Math.round((new Date().setHours(0, 0, 0, 0) - new Date(date).setHours(0, 0, 0, 0)) / 86400000);
+  if (days === 0) return `Today, ${time}`;
+  if (days === 1) return `Yesterday, ${time}`;
+  return `${date.toLocaleDateString([], { month: "short", day: "numeric" })}, ${time}`;
+}
+
+// Listening numbers come from the API when it is available; otherwise from this device's history.
+function listeningView() {
+  if (state.apiAvailable && state.stats) {
+    const stats = state.stats;
+    return {
+      totalSeconds: stats.totalSeconds,
+      sides: stats.sides,
+      albumCount: stats.albums,
+      topGenre: stats.topGenre,
+      days: stats.days,
+      topAlbums: stats.topAlbums.map(item => ({ id: item.id, title: item.title, artist: item.artist, cover: item.coverUrl, sides: item.sides })),
+      history: stats.history.map(item => ({
+        id: item.collectionReleaseId,
+        title: item.title,
+        artist: item.artist,
+        cover: item.coverUrl,
+        side: `Side ${item.side}`,
+        length: formatSideLength(item.durationSeconds),
+        when: formatWhen(item.startedAt)
+      })),
+      collectionCount: stats.collectionCount
+    };
+  }
+
+  const history = state.history;
+  const perDay = new Map();
+  const perAlbum = new Map();
+  const perGenre = new Map();
+  let totalSeconds = 0;
+  for (const item of history) {
+    const seconds = sideDuration(item.album, item.side);
+    totalSeconds += seconds;
+    if (item.at) perDay.set(dayKey(new Date(item.at)), (perDay.get(dayKey(new Date(item.at))) || 0) + seconds);
+    perAlbum.set(item.album.id, { album: item.album, sides: (perAlbum.get(item.album.id)?.sides || 0) + 1 });
+    perGenre.set(item.album.genre, (perGenre.get(item.album.genre) || 0) + 1);
+  }
+  const days = Array.from({ length: 14 }, (_, index) => {
+    const date = new Date();
+    date.setDate(date.getDate() - (13 - index));
+    return { date: dayKey(date), seconds: perDay.get(dayKey(date)) || 0 };
+  });
+  const [genreName, genreSides] = [...perGenre.entries()].sort((a, b) => b[1] - a[1])[0] || [];
+  return {
+    totalSeconds,
+    sides: history.length,
+    albumCount: perAlbum.size,
+    topGenre: genreName ? { name: genreName, sides: genreSides } : null,
+    days,
+    topAlbums: [...perAlbum.values()].sort((a, b) => b.sides - a.sides).slice(0, 3)
+      .map(({ album, sides }) => ({ id: album.id, title: album.title, artist: album.artist, cover: album.cover, sides })),
+    history: history.map(item => ({
+      id: item.album.id,
+      title: item.album.title,
+      artist: item.album.artist,
+      cover: item.album.cover,
+      side: item.album.sides[item.side].name,
+      length: item.album.sides[item.side].length,
+      when: item.at ? formatWhen(item.at) : item.startedAt
+    })),
+    collectionCount: albums.length
+  };
+}
+
+async function loadStats() {
+  try {
+    const response = await fetch("api/stats");
+    if (!response.ok) return;
+    state.stats = await response.json();
+    render();
+  } catch {
+    // Without the API the numbers fall back to this device's history.
+  }
 }
 
 function asUiAlbum(record) {
@@ -199,6 +295,7 @@ async function checkApi() {
       void hydrateSelectedRecord(syncedAlbums[0].serverId);
     }
     render();
+    void loadStats();
   } catch {
     // The interface remains fully usable with sample data before the API is configured.
   }
@@ -244,7 +341,7 @@ function layout(content) {
         ${navItem("stats", "Your stats", "chart")}
       </nav>
       <div class="sidebar-footer">
-        <button class="mini-profile" data-action="profile"><span class="avatar">SB</span><span><strong>Sathya</strong><small>78 records</small></span>${icon("more")}</button>
+        <button class="mini-profile" data-action="profile"><span class="avatar">SB</span><span><strong>Sathya</strong><small>${state.stats?.collectionCount ?? albums.length} records</small></span>${icon("more")}</button>
         <button class="settings-link" data-page="settings">${icon("settings")}Settings</button>
       </div>
     </aside>
@@ -274,11 +371,10 @@ function mobileNavItem(page, label, iconName) {
 }
 
 function homePage() {
-  const recent = state.history.length ? state.history.slice(0, 3) : [
-    { album: albums[2], side: 1, startedAt: "Yesterday" },
-    { album: albums[5], side: 0, startedAt: "Friday" },
-    { album: albums[3], side: 0, startedAt: "Thursday" }
-  ];
+  const view = listeningView();
+  const recent = view.history.slice(0, 3);
+  const week = view.days.slice(-7);
+  const weekMax = Math.max(...week.map(day => day.seconds), 1);
   const nowPlaying = state.isPlaying;
   return layout(`<div class="page home-page">
     <header class="page-head">
@@ -317,7 +413,7 @@ function homePage() {
     </section>
 
     <section class="section-heading">
-      <div><h2>Pick something from your shelf</h2><p>78 records in your Discogs collection</p></div>
+      <div><h2>Pick something from your shelf</h2><p>${state.apiAvailable ? `${view.collectionCount} records in your Discogs collection` : "Sample records until your Discogs collection is connected"}</p></div>
       <button class="text-button" data-page="collection">Browse collection ${icon("arrow")}</button>
     </section>
     <section class="shelf-grid">${albums.slice(0, 4).map(albumCard).join("")}</section>
@@ -325,11 +421,11 @@ function homePage() {
     <section class="lower-grid">
       <div class="recent-listens">
         <div class="section-heading compact"><div><h2>Recently played</h2></div><button class="text-button" data-page="stats">View history ${icon("arrow")}</button></div>
-        ${recent.map(item => `<button class="recent-row" data-album="${item.album.id}"><span class="tiny-cover" style="--cover:url('${item.album.cover}')"></span><span><strong>${item.album.title}</strong><small>${item.album.artist} · ${item.album.sides[item.side].name}</small></span><em>${item.startedAt}</em>${icon("chevron")}</button>`).join("")}
+        ${recent.map(item => `<button class="recent-row" data-album="${item.id}"><span class="tiny-cover" style="--cover:url('${item.cover}')"></span><span><strong>${item.title}</strong><small>${item.artist} · ${item.side}</small></span><em>${item.when}</em>${icon("chevron")}</button>`).join("") || `<div class="empty-state">Nothing played yet. Start tracking a side to build your history.</div>`}
       </div>
       <aside class="weekly-card">
-        <span class="sparkle">✦</span><p class="eyebrow">This week</p><strong>4h 12m</strong><span>of intentional listening</span>
-        <div class="week-bars"><i style="--h:40%"></i><i style="--h:66%"></i><i style="--h:24%"></i><i style="--h:100%"></i><i style="--h:72%"></i><i style="--h:30%"></i><i style="--h:9%"></i></div>
+        <span class="sparkle">✦</span><p class="eyebrow">This week</p><strong>${formatHours(week.reduce((sum, day) => sum + day.seconds, 0))}</strong><span>of intentional listening</span>
+        <div class="week-bars">${week.map(day => `<i style="--h:${Math.max(Math.round(day.seconds / weekMax * 100), 4)}%"></i>`).join("")}</div>
       </aside>
     </section>
   </div>`);
@@ -363,21 +459,24 @@ function collectionPage() {
 }
 
 function statsPage() {
-  const totalSeconds = state.history.reduce((sum, item) => sum + sideDuration(item.album, item.side), 0) + 252 * 60;
-  const plays = state.history.length + 18;
+  const view = listeningView();
+  const max = Math.max(...view.days.map(day => day.seconds), 1);
+  const peak = view.days.reduce((best, day, index) => day.seconds > view.days[best].seconds ? index : best, 0);
+  const total14 = view.days.reduce((sum, day) => sum + day.seconds, 0);
+  const axis = [0, 4, 9, 13].map(index => new Date(`${view.days[index].date}T00:00`).toLocaleDateString([], { month: "short", day: "numeric" }));
   return layout(`<div class="page stats-page">
     <header class="page-head"><div><p class="eyebrow">Your listening room</p><h1>Good music, kept close.</h1></div><button class="period-button">Last 30 days <span>⌄</span></button></header>
     <section class="stat-grid">
-      <article><span class="stat-icon amber">${icon("note")}</span><p>Time listening</p><strong>${formatDuration(totalSeconds)}</strong><small>↑ 18% from last month</small></article>
-      <article><span class="stat-icon green">${icon("collection")}</span><p>Record sides played</p><strong>${plays}</strong><small>Across ${Math.min(12, plays)} albums</small></article>
-      <article><span class="stat-icon pink">${icon("chart")}</span><p>Most played genre</p><strong>Soul</strong><small>6 sides this month</small></article>
+      <article><span class="stat-icon amber">${icon("note")}</span><p>Time listening</p><strong>${formatHours(view.totalSeconds)}</strong><small>${view.sides ? "Estimated from record side lengths" : "Nothing tracked yet"}</small></article>
+      <article><span class="stat-icon green">${icon("collection")}</span><p>Record sides played</p><strong>${view.sides}</strong><small>${view.sides ? `Across ${view.albumCount} ${view.albumCount === 1 ? "album" : "albums"}` : "Start tracking a side"}</small></article>
+      <article><span class="stat-icon pink">${icon("chart")}</span><p>Most played genre</p><strong>${view.topGenre ? view.topGenre.name : "—"}</strong><small>${view.topGenre ? `${view.topGenre.sides} ${view.topGenre.sides === 1 ? "side" : "sides"}` : "No plays yet"}</small></article>
     </section>
     <section class="analytics-grid">
-      <article class="chart-card"><div class="card-title"><div><h2>Listening rhythm</h2><p>Minutes played each day</p></div><span class="chart-total">4h 12m</span></div><div class="bar-chart">${[26, 51, 19, 74, 100, 45, 67, 31, 88, 49, 73, 38, 61, 92].map((h, i) => `<span class="${i === 9 ? "highlight" : ""}" style="--value:${h}%"></span>`).join("")}</div><div class="chart-axis"><span>Sep 1</span><span>Sep 8</span><span>Sep 15</span><span>Sep 22</span></div></article>
-      <article class="top-albums"><div class="card-title"><div><h2>On repeat</h2><p>Your most-played records</p></div></div>${albums.slice(0, 3).map((album, i) => `<button data-album="${album.id}"><span class="rank">0${i + 1}</span><span class="tiny-cover" style="--cover:url('${album.cover}')"></span><span><strong>${album.title}</strong><small>${album.artist}</small></span><em>${5 - i} sides</em></button>`).join("")}</article>
+      <article class="chart-card"><div class="card-title"><div><h2>Listening rhythm</h2><p>Time played each day, last 14 days</p></div><span class="chart-total">${formatHours(total14)}</span></div><div class="bar-chart">${view.days.map((day, i) => `<span class="${day.seconds && i === peak ? "highlight" : ""}" style="--value:${Math.max(Math.round(day.seconds / max * 100), 3)}%"></span>`).join("")}</div><div class="chart-axis">${axis.map(label => `<span>${label}</span>`).join("")}</div></article>
+      <article class="top-albums"><div class="card-title"><div><h2>On repeat</h2><p>Your most-played records</p></div></div>${view.topAlbums.map((album, i) => `<button data-album="${album.id}"><span class="rank">0${i + 1}</span><span class="tiny-cover" style="--cover:url('${album.cover}')"></span><span><strong>${album.title}</strong><small>${album.artist}</small></span><em>${album.sides} ${album.sides === 1 ? "side" : "sides"}</em></button>`).join("") || `<div class="empty-state">Your most-played records will show up here.</div>`}</article>
     </section>
     <section class="history-card"><div class="card-title"><div><h2>Listening history</h2><p>Every side, carefully saved.</p></div></div>
-      ${(state.history.length ? state.history : [{album: albums[0], side: 0, startedAt: "Today, 9:41 AM"}, {album: albums[2], side: 1, startedAt: "Yesterday, 8:17 PM"}, {album: albums[1], side: 0, startedAt: "Sep 24, 6:32 PM"}]).map(item => `<div class="history-row"><span class="tiny-cover" style="--cover:url('${item.album.cover}')"></span><span><strong>${item.album.artist} — ${item.album.title}</strong><small>${item.album.sides[item.side].name} · ${item.album.sides[item.side].length} · Scrobbled</small></span><time>${item.startedAt}</time></div>`).join("")}</section>
+      ${view.history.map(item => `<div class="history-row"><span class="tiny-cover" style="--cover:url('${item.cover}')"></span><span><strong>${item.artist} — ${item.title}</strong><small>${item.side} · ${item.length} · Scrobble queued</small></span><time>${item.when}</time></div>`).join("") || `<div class="empty-state">No listens yet.</div>`}</section>
   </div>`);
 }
 
@@ -426,7 +525,7 @@ function attachEvents() {
       state.isPlaying = !state.isPlaying;
       if (state.isPlaying) {
         const now = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-        state.history.unshift({ album: state.selected, side: state.selectedSide, startedAt: `Today, ${now}` });
+        state.history.unshift({ album: state.selected, side: state.selectedSide, startedAt: `Today, ${now}`, at: new Date().toISOString() });
         localStorage.setItem("groove-history", JSON.stringify(state.history));
         state.toast = `${state.selected.sides[state.selectedSide].name} is now being tracked`;
         if (state.selected.serverId) {
@@ -437,7 +536,7 @@ function attachEvents() {
             body: JSON.stringify({ collectionReleaseId: state.selected.serverId, side })
           })
             .then(response => response.ok ? response.json() : Promise.reject(new Error("Unable to save listen")))
-            .then(({ listen }) => { state.remoteListenId = listen.id; })
+            .then(({ listen }) => { state.remoteListenId = listen.id; void loadStats(); })
             .catch(() => {
               state.toast = "Tracking locally — the server could not save this listen.";
               render();

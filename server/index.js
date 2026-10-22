@@ -247,7 +247,7 @@ app.post("/api/listens", async (request, reply) => {
       `INSERT INTO listens (
         user_id, collection_release_id, side, started_at, expected_ended_at, duration_estimated, tracks
       ) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-      [user.id, release.id, side, started, expectedEnd, durationEstimated, tracks]
+      [user.id, release.id, side, started, expectedEnd, durationEstimated, JSON.stringify(tracks)]
     );
     for (const track of tracks) {
       await client.query(
@@ -267,6 +267,61 @@ app.post("/api/listens", async (request, reply) => {
   } finally {
     client.release();
   }
+});
+
+app.get("/api/stats", async () => {
+  const user = await localUser();
+  const sideSeconds = "EXTRACT(EPOCH FROM (l.expected_ended_at - l.started_at))";
+  const genre = "COALESCE(r.styles[1], r.genres[1])";
+  const [totals, genres, days, top, history, collection] = await Promise.all([
+    db.query(
+      `SELECT COUNT(*)::int AS sides, COUNT(DISTINCT l.collection_release_id)::int AS albums,
+              COALESCE(SUM(${sideSeconds}), 0)::int AS seconds
+       FROM listens l WHERE l.user_id = $1 AND l.started_at > now() - interval '30 days'`,
+      [user.id]
+    ),
+    db.query(
+      `SELECT ${genre} AS name, COUNT(*)::int AS sides
+       FROM listens l JOIN collection_releases r ON r.id = l.collection_release_id
+       WHERE l.user_id = $1 AND l.started_at > now() - interval '30 days' AND ${genre} IS NOT NULL
+       GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 1`,
+      [user.id]
+    ),
+    db.query(
+      `SELECT to_char(d::date, 'YYYY-MM-DD') AS date,
+              COALESCE(SUM(${sideSeconds}), 0)::int AS seconds
+       FROM generate_series(current_date - 13, current_date, interval '1 day') d
+       LEFT JOIN listens l ON l.user_id = $1 AND l.started_at::date = d::date
+       GROUP BY d ORDER BY d`,
+      [user.id]
+    ),
+    db.query(
+      `SELECT r.id, r.artist, r.title, r.cover_url AS "coverUrl", COUNT(*)::int AS sides
+       FROM listens l JOIN collection_releases r ON r.id = l.collection_release_id
+       WHERE l.user_id = $1 AND l.started_at > now() - interval '30 days'
+       GROUP BY r.id ORDER BY sides DESC, MAX(l.started_at) DESC LIMIT 3`,
+      [user.id]
+    ),
+    db.query(
+      `SELECT l.id, r.id AS "collectionReleaseId", r.artist, r.title, r.cover_url AS "coverUrl",
+              l.side, l.started_at AS "startedAt", ${sideSeconds}::int AS "durationSeconds"
+       FROM listens l JOIN collection_releases r ON r.id = l.collection_release_id
+       WHERE l.user_id = $1 ORDER BY l.started_at DESC LIMIT 20`,
+      [user.id]
+    ),
+    db.query("SELECT COUNT(*)::int AS count FROM collection_releases WHERE user_id = $1", [user.id])
+  ]);
+
+  return {
+    totalSeconds: totals.rows[0].seconds,
+    sides: totals.rows[0].sides,
+    albums: totals.rows[0].albums,
+    topGenre: genres.rows[0] || null,
+    days: days.rows,
+    topAlbums: top.rows,
+    history: history.rows,
+    collectionCount: collection.rows[0].count
+  };
 });
 
 app.patch("/api/listens/:listenId", async request => {
