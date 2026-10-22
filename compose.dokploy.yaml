@@ -5,6 +5,7 @@
 x-app-environment: &app-environment
   DATABASE_URL: postgresql://groove:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@db:5432/groove_tracker
   # Same origin as the PWA, over HTTPS: the Discogs OAuth callback is derived from API_ORIGIN.
+  DATABASE_SSL: "false"
   APP_ORIGIN: https://${GROOVE_TAILNET_HOST:?set GROOVE_TAILNET_HOST}/groove
   API_ORIGIN: https://${GROOVE_TAILNET_HOST}/groove
   PORT: "3001"

@@ -2,6 +2,7 @@ name: groove-tracker
 
 x-app-environment: &app-environment
   DATABASE_URL: postgresql://groove:${POSTGRES_PASSWORD:-groove}@db:5432/groove_tracker
+  DATABASE_SSL: "false"
   APP_ORIGIN: ${APP_ORIGIN:-http://localhost:5173}
   API_ORIGIN: ${API_ORIGIN:-http://localhost:3001}
   DISCOGS_CONSUMER_KEY: ${DISCOGS_CONSUMER_KEY:-}

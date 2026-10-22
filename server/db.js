@@ -9,7 +9,10 @@ if (!process.env.DATABASE_URL) {
 
 export const db = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL.includes("localhost") ? false : { rejectUnauthorized: false }
+  // Set DATABASE_SSL=false for a Postgres without TLS, such as the Compose database container.
+  ssl: process.env.DATABASE_SSL === "false" || process.env.DATABASE_URL.includes("localhost")
+    ? false
+    : { rejectUnauthorized: false }
 });
 
 export async function getLocalUser() {
