@@ -109,6 +109,8 @@ const state = {
   selected: albums[0],
   selectedSide: 0,
   isPlaying: false,
+  playing: null,
+  trackKey: "",
   query: "",
   genre: "All genres",
   syncFrequency: "Weekly",
@@ -251,12 +253,36 @@ async function loadStats() {
   }
 }
 
+// Which track of the side being played is on now, from the time since tracking started.
+// Tracks without a known length count as 3 minutes, the same estimate the server uses for scrobbles.
+function currentTrack() {
+  const { album, side, startedAt } = state.playing;
+  const { tracks, trackSeconds = [] } = album.sides[side];
+  const elapsed = (Date.now() - startedAt) / 1000;
+  let end = 0;
+  for (let index = 0; index < tracks.length; index += 1) {
+    end += trackSeconds[index] || 180;
+    if (elapsed < end) return { index, title: tracks[index], total: tracks.length, finished: false };
+  }
+  return { index: tracks.length - 1, title: tracks[tracks.length - 1], total: tracks.length, finished: true };
+}
+
+setInterval(() => {
+  if (!state.isPlaying || !state.playing || state.page !== "home") return;
+  const current = currentTrack();
+  const key = `${current.index}:${current.finished}`;
+  if (key === state.trackKey) return;
+  state.trackKey = key;
+  render();
+}, 1000);
+
 function asUiAlbum(record) {
   const sides = record.sides?.length
     ? record.sides.map(side => ({
         name: `Side ${side.side}`,
         length: formatSideLength(side.durationSeconds),
-        tracks: side.tracks.map(track => track.title)
+        tracks: side.tracks.map(track => track.title),
+        trackSeconds: side.tracks.map(track => track.durationSeconds || 0)
       }))
     : [
         { name: "Side A", length: "—", tracks: ["Select this record to load its tracklist"] },
@@ -375,7 +401,15 @@ function homePage() {
   const recent = view.history.slice(0, 3);
   const week = view.days.slice(-7);
   const weekMax = Math.max(...week.map(day => day.seconds), 1);
-  const nowPlaying = state.isPlaying;
+  const nowPlaying = state.isPlaying && state.playing;
+  const current = nowPlaying ? currentTrack() : null;
+  const sameSide = nowPlaying && state.playing.album.id === state.selected.id && state.playing.side === state.selectedSide;
+  const selectedSide = state.selected.sides[state.selectedSide];
+  const trackNote = nowPlaying
+    ? current.finished
+      ? `${icon("check")}<span>Side finished — tap to stop tracking</span>`
+      : `<i class="pulse"></i><span>Now playing · ${current.index + 1} of ${current.total}<strong>${current.title}${state.playing.album.id === state.selected.id ? "" : ` — ${state.playing.album.title}`}</strong></span>`
+    : `${icon("note")}<span>Starts with<strong>${selectedSide.tracks[0] || "—"}</strong></span>`;
   return layout(`<div class="page home-page">
     <header class="page-head">
       <div>
@@ -402,12 +436,12 @@ function homePage() {
         <button class="primary-button" data-action="track">
           ${icon(nowPlaying ? "note" : "play")}<span>${nowPlaying ? "Tracking this side" : `Start tracking ${state.selected.sides[state.selectedSide].name}`}</span>
         </button>
-        <p class="scrobble-note">${icon("check")}Each track will be saved & scrobbled to Last.fm</p>
+        <p class="current-track ${nowPlaying ? "is-live" : ""}">${trackNote}</p>
       </div>
       <div class="queue-panel">
         <div class="queue-head"><span>${state.selected.sides[state.selectedSide].name} queue</span><small>${state.selected.sides[state.selectedSide].tracks.length} tracks</small></div>
         <ol>
-          ${state.selected.sides[state.selectedSide].tracks.map((track, i) => `<li><span>${String(i + 1).padStart(2, "0")}</span><strong>${track}</strong><small>${i === 0 && nowPlaying ? "playing" : ""}</small></li>`).join("")}
+          ${state.selected.sides[state.selectedSide].tracks.map((track, i) => `<li><span>${String(i + 1).padStart(2, "0")}</span><strong>${track}</strong><small>${sameSide && !current.finished && i === current.index ? "playing" : ""}</small></li>`).join("")}
         </ol>
       </div>
     </section>
@@ -524,6 +558,8 @@ function attachEvents() {
     if (button.dataset.action === "track") {
       state.isPlaying = !state.isPlaying;
       if (state.isPlaying) {
+        state.playing = { album: state.selected, side: state.selectedSide, startedAt: Date.now() };
+        state.trackKey = "0:false";
         const now = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
         state.history.unshift({ album: state.selected, side: state.selectedSide, startedAt: `Today, ${now}`, at: new Date().toISOString() });
         localStorage.setItem("groove-history", JSON.stringify(state.history));
@@ -543,6 +579,7 @@ function attachEvents() {
             });
         }
       } else {
+        state.playing = null;
         state.toast = "Tracking stopped — the play has been saved";
         if (state.remoteListenId) {
           fetch(`api/listens/${state.remoteListenId}`, {
