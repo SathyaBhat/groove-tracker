@@ -42,6 +42,14 @@ npm run dev
 
 Open Settings in the PWA and choose **Connect Discogs**. The collection sync control calls the API once the account is connected.
 
+## End-to-end tests
+
+```sh
+e2e/run.sh
+```
+
+The script needs only Docker; the Compose plugin is not required. It builds the app image and starts Postgres, the API, and Vite on an isolated `groove-e2e` network with no host ports. It seeds two records with cached tracklists, so no Discogs credentials are needed, then runs Playwright in `mcr.microsoft.com/playwright:v1.56.1-noble`. The checks cover the empty deck, search and loading a record, playback across tabs and reloads, SSE updates, a side finishing, concurrent starts, input validation, the phone layout, and sample mode. Screenshots are written to `e2e/artifacts/` (git-ignored). The script removes every `groove-e2e-*` container and the network when it exits.
+
 ## Run with Docker Compose
 
 The Compose stack starts PostgreSQL, the API, the Vite PWA, and an hourly sync worker.
