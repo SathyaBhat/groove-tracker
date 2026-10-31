@@ -13,10 +13,12 @@ import {
 import {
   hydrateRelease,
   serializeRelease,
-  syncCollection,
-  tracksForSide
+  syncCollection
 } from "./collection.js";
+import { activeListen, startListen, stopListen } from "./listens.js";
+import { onPlayback, publishPlayback } from "./events.js";
 
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const app = Fastify({ logger: true });
 const appOrigin = process.env.APP_ORIGIN || "http://localhost:5173";
 const apiOrigin = process.env.API_ORIGIN || "http://localhost:3001";
@@ -206,7 +208,7 @@ app.patch("/api/settings/sync-frequency", async request => {
 
 app.post("/api/listens", async (request, reply) => {
   const { collectionReleaseId, side, startedAt } = request.body || {};
-  if (!collectionReleaseId || !/^[A-D]$/.test(side || "")) {
+  if (!uuidPattern.test(collectionReleaseId || "") || !/^[A-D]$/.test(side || "")) {
     return reply.code(400).send({ error: "collectionReleaseId and side (A-D) are required." });
   }
 
@@ -214,59 +216,61 @@ app.post("/api/listens", async (request, reply) => {
   const release = await hydrateRelease(user.id, collectionReleaseId);
   if (!release) return reply.code(404).send({ error: "Record not found." });
 
-  const sideTracks = tracksForSide(release.tracklist, side);
-  if (!sideTracks.length) {
-    return reply.code(422).send({ error: `No ${side}-side tracks are available for this release.` });
-  }
-
   const started = startedAt ? new Date(startedAt) : new Date();
   if (Number.isNaN(started.getTime())) {
     return reply.code(400).send({ error: "startedAt must be a valid ISO timestamp." });
   }
 
-  const durationEstimated = sideTracks.some(track => !track.durationSeconds);
-  const fallbackTrackDuration = 180;
-  let elapsedSeconds = 0;
-  const tracks = sideTracks.map((track, index) => {
-    const durationSeconds = track.durationSeconds || fallbackTrackDuration;
-    const payload = {
-      ...track,
-      index,
-      durationSeconds,
-      startsAt: new Date(started.getTime() + elapsedSeconds * 1000).toISOString()
-    };
-    elapsedSeconds += durationSeconds;
-    return payload;
-  });
-  const expectedEnd = new Date(started.getTime() + elapsedSeconds * 1000);
-
-  const client = await db.connect();
-  try {
-    await client.query("BEGIN");
-    const listen = await client.query(
-      `INSERT INTO listens (
-        user_id, collection_release_id, side, started_at, expected_ended_at, duration_estimated, tracks
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-      [user.id, release.id, side, started, expectedEnd, durationEstimated, JSON.stringify(tracks)]
-    );
-    for (const track of tracks) {
-      await client.query(
-        `INSERT INTO scrobble_jobs (listen_id, track_position, scheduled_at)
-         VALUES ($1, $2, $3)`,
-        [listen.rows[0].id, track.index, track.startsAt]
-      );
-    }
-    await client.query("COMMIT");
-    return reply.code(201).send({
-      listen: listen.rows[0],
-      message: "Listening session saved. Track scrobbles are queued."
-    });
-  } catch (error) {
-    await client.query("ROLLBACK");
-    throw error;
-  } finally {
-    client.release();
+  const listen = await startListen(user.id, release, side, started);
+  if (!listen) {
+    return reply.code(422).send({ error: `No ${side}-side tracks are available for this release.` });
   }
+  publishPlayback(user.id);
+  return reply.code(201).send({
+    listen,
+    message: "Listening session saved. Track scrobbles are queued."
+  });
+});
+
+app.get("/api/listens/current", async () => {
+  const user = await localUser();
+  return { listen: await activeListen(user.id), serverTime: new Date().toISOString() };
+});
+
+// Server-Sent Events: each message carries the full playback state, so a client that
+// reconnects or misses a message is correct again after the next one.
+app.get("/api/listens/stream", async (request, reply) => {
+  const user = await localUser();
+  reply.hijack();
+  const res = reply.raw;
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    // Stops nginx-style proxies from buffering the stream.
+    "X-Accel-Buffering": "no"
+  });
+
+  let closed = false;
+  const send = async () => {
+    try {
+      const payload = { listen: await activeListen(user.id), serverTime: new Date().toISOString() };
+      if (!closed) res.write(`event: playback\ndata: ${JSON.stringify(payload)}\n\n`);
+    } catch (error) {
+      request.log.error(error, "Unable to send playback event");
+    }
+  };
+
+  res.write("retry: 3000\n\n");
+  const unsubscribe = onPlayback(user.id, send);
+  // A comment line keeps idle proxies from closing the connection.
+  const heartbeat = setInterval(() => res.write(": ping\n\n"), 25000);
+  request.raw.on("close", () => {
+    closed = true;
+    clearInterval(heartbeat);
+    unsubscribe();
+  });
+  await send();
 });
 
 app.get("/api/stats", async () => {
@@ -324,21 +328,19 @@ app.get("/api/stats", async () => {
   };
 });
 
-app.patch("/api/listens/:listenId", async request => {
-  const { status = "completed" } = request.body || {};
+app.patch("/api/listens/:listenId", async (request, reply) => {
+  const { status = "stopped" } = request.body || {};
   if (!["completed", "stopped"].includes(status)) {
-    const error = new Error("status must be completed or stopped.");
-    error.statusCode = 400;
-    throw error;
+    return reply.code(400).send({ error: "status must be completed or stopped." });
+  }
+  if (!uuidPattern.test(request.params.listenId)) {
+    return reply.code(400).send({ error: "listenId must be a UUID." });
   }
   const user = await localUser();
-  const result = await db.query(
-    `UPDATE listens SET status = $3, completed_at = now()
-     WHERE id = $1 AND user_id = $2
-     RETURNING *`,
-    [request.params.listenId, user.id, status]
-  );
-  return result.rows[0] || { error: "Listening session not found." };
+  const stopped = await stopListen(user.id, request.params.listenId, status);
+  if (!stopped) return reply.code(404).send({ error: "No playing listen with that id." });
+  publishPlayback(user.id);
+  return { listen: null };
 });
 
 app.setErrorHandler((error, _request, reply) => {

@@ -106,11 +106,18 @@ const icons = {
 
 const state = {
   page: "home",
-  selected: albums[0],
+  // The record loaded on the deck but not playing. null shows the empty turntable.
+  selected: null,
   selectedSide: 0,
-  isPlaying: false,
-  playing: null,
+  justLoaded: false,
+  loadingId: null,
+  // The side being played. The API owns it; sample mode keeps it in localStorage.
+  playback: null,
+  pendingStart: false,
+  clockOffset: 0,
   trackKey: "",
+  homeQuery: "",
+  searchResults: [],
   query: "",
   genre: "All genres",
   syncFrequency: "Weekly",
@@ -119,8 +126,12 @@ const state = {
   apiAvailable: false,
   stats: null,
   discogs: { connected: false, username: null },
-  remoteListenId: null
+  loadedAt: 0
 };
+
+// Records seen through the collection list or search, by id, so any card or result can be loaded.
+const knownRecords = new Map(albums.map(album => [String(album.id), album]));
+const samplePlaybackKey = "groove-playback";
 
 const app = document.querySelector("#app");
 const discogsResult = new URLSearchParams(window.location.search).get("discogs");
@@ -130,6 +141,10 @@ if (discogsResult) {
     ? "Discogs connected — sync your collection when you’re ready."
     : "Discogs connection was cancelled.";
   window.history.replaceState({}, "", window.location.pathname);
+}
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
 }
 
 function icon(name) {
@@ -253,28 +268,190 @@ async function loadStats() {
   }
 }
 
-// Which track of the side being played is on now, from the time since tracking started.
-// Tracks without a known length count as 3 minutes, the same estimate the server uses for scrobbles.
-function currentTrack() {
-  const { album, side, startedAt } = state.playing;
-  const { tracks, trackSeconds = [] } = album.sides[side];
-  const elapsed = (Date.now() - startedAt) / 1000;
-  let end = 0;
-  for (let index = 0; index < tracks.length; index += 1) {
-    end += trackSeconds[index] || 180;
-    if (elapsed < end) return { index, title: tracks[index], total: tracks.length, finished: false };
+function now() {
+  return Date.now() + state.clockOffset;
+}
+
+function formatClock(seconds) {
+  const safe = Math.max(Math.floor(seconds), 0);
+  return `${Math.floor(safe / 60)}:${String(safe % 60).padStart(2, "0")}`;
+}
+
+function rememberAlbum(album) {
+  const existing = knownRecords.get(String(album.id));
+  // Never replace a record with a loaded tracklist by its collection summary.
+  if (existing?.hydrated && !album.hydrated) return existing;
+  knownRecords.set(String(album.id), album);
+  const index = albums.findIndex(item => String(item.id) === String(album.id));
+  if (index >= 0) albums[index] = album;
+  return album;
+}
+
+function findAlbum(id) {
+  return knownRecords.get(String(id)) || albums.find(album => String(album.id) === String(id)) || null;
+}
+
+// The playback shape used by the UI, built from a server listen.
+function playbackFromListen(listen) {
+  const album = rememberAlbum(asUiAlbum(listen.record));
+  const sideIndex = Math.max(album.sides.findIndex(side => side.name === `Side ${listen.side}`), 0);
+  return {
+    id: listen.id,
+    album,
+    sideIndex,
+    startedAt: Date.parse(listen.startedAt),
+    endsAt: Date.parse(listen.expectedEndedAt),
+    tracks: listen.tracks.map(track => ({
+      title: track.title,
+      startsAt: Date.parse(track.startsAt),
+      durationSeconds: track.durationSeconds
+    }))
+  };
+}
+
+// The same shape built locally: for sample records, and as the immediate state while the API saves a start.
+// Tracks without a known length count as 3 minutes, the estimate the server uses for scrobbles.
+function plannedPlayback(album, sideIndex, startedAt) {
+  const side = album.sides[sideIndex];
+  let offset = 0;
+  const tracks = side.tracks.map((title, index) => {
+    const durationSeconds = side.trackSeconds?.[index] || 180;
+    const track = { title, startsAt: startedAt + offset * 1000, durationSeconds };
+    offset += durationSeconds;
+    return track;
+  });
+  return { id: null, album, sideIndex, startedAt, endsAt: startedAt + offset * 1000, tracks };
+}
+
+function playbackPosition(playback) {
+  const time = now();
+  const { tracks } = playback;
+  let index = tracks.findIndex((track, i) => time < (tracks[i + 1]?.startsAt ?? playback.endsAt));
+  if (index < 0) index = tracks.length - 1;
+  const track = tracks[index];
+  const trackEnd = tracks[index + 1]?.startsAt ?? playback.endsAt;
+  const elapsed = Math.max((time - track.startsAt) / 1000, 0);
+  const length = Math.max((trackEnd - track.startsAt) / 1000, 1);
+  return {
+    index,
+    track,
+    next: tracks[index + 1] || null,
+    elapsed: Math.min(elapsed, length),
+    length,
+    finished: time >= playback.endsAt
+  };
+}
+
+// Sample records have no server, so their playback is kept in localStorage and shared between tabs.
+function saveSamplePlayback() {
+  const playback = state.playback;
+  if (playback && !playback.album.serverId) {
+    localStorage.setItem(samplePlaybackKey, JSON.stringify({ albumId: playback.album.id, sideIndex: playback.sideIndex, startedAt: playback.startedAt }));
+  } else {
+    localStorage.removeItem(samplePlaybackKey);
   }
-  return { index: tracks.length - 1, title: tracks[tracks.length - 1], total: tracks.length, finished: true };
+}
+
+function restoreSamplePlayback() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(samplePlaybackKey) || "null");
+    const album = saved && findAlbum(saved.albumId);
+    const playback = album?.sides[saved.sideIndex] ? plannedPlayback(album, saved.sideIndex, saved.startedAt) : null;
+    if (playback && now() < playback.endsAt) {
+      state.playback = playback;
+      return;
+    }
+  } catch {
+    // A corrupt saved state is treated as nothing playing.
+  }
+  state.playback = null;
+  localStorage.removeItem(samplePlaybackKey);
+}
+
+function applyServerPlayback({ listen, serverTime }) {
+  if (serverTime) state.clockOffset = Date.parse(serverTime) - Date.now();
+  // The start request's own response is authoritative for the side being started.
+  if (state.pendingStart) return;
+  const previous = state.playback;
+  state.playback = listen ? playbackFromListen(listen) : null;
+  if (!listen && previous) {
+    state.selected = previous.album;
+    state.selectedSide = previous.sideIndex;
+  }
+  if (previous?.id !== state.playback?.id) void loadStats();
+  render();
+}
+
+async function refreshPlayback() {
+  try {
+    const response = await fetch("api/listens/current");
+    if (response.ok) applyServerPlayback(await response.json());
+  } catch {
+    // The event stream will deliver the state once the API is reachable again.
+  }
+}
+
+// Server-Sent Events keep every open tab on the same side. EventSource reconnects by itself;
+// if the server refuses the stream outright, try again after a pause.
+let playbackStream = null;
+
+function connectPlaybackStream() {
+  if (playbackStream) return;
+  if (!("EventSource" in window)) {
+    playbackStream = "polling";
+    setInterval(refreshPlayback, 15000);
+    void refreshPlayback();
+    return;
+  }
+  const source = new EventSource("api/listens/stream");
+  playbackStream = source;
+  source.addEventListener("playback", event => applyServerPlayback(JSON.parse(event.data)));
+  source.addEventListener("error", () => {
+    if (source.readyState !== EventSource.CLOSED) return;
+    playbackStream = null;
+    setTimeout(connectPlaybackStream, 10000);
+  });
+}
+
+// Each tab finishes the side from the shared start time; the server marks it completed the same way.
+function finishSide() {
+  const { album, sideIndex } = state.playback;
+  const nextSide = album.sides[sideIndex + 1];
+  state.playback = null;
+  state.selected = album;
+  state.selectedSide = nextSide ? sideIndex + 1 : sideIndex;
+  state.toast = nextSide ? `${album.sides[sideIndex].name} finished — flip to ${nextSide.name}` : `${album.title} finished`;
+  if (album.serverId) void loadStats();
+  else saveSamplePlayback();
+  render();
+}
+
+function updateProgress(position) {
+  document.querySelector("[data-track-progress]")?.style.setProperty("--progress", `${(position.elapsed / position.length) * 100}%`);
+  const time = document.querySelector("[data-track-time]");
+  if (time) time.innerHTML = `<span>${formatClock(position.elapsed)}</span><span>${formatClock(position.length)}</span>`;
 }
 
 setInterval(() => {
-  if (!state.isPlaying || !state.playing || state.page !== "home") return;
-  const current = currentTrack();
-  const key = `${current.index}:${current.finished}`;
-  if (key === state.trackKey) return;
-  state.trackKey = key;
-  render();
+  const playback = state.playback;
+  if (!playback || state.pendingStart) return;
+  const position = playbackPosition(playback);
+  if (position.finished) return finishSide();
+  if (state.page !== "home") return;
+  if (`${playback.id}:${position.index}` !== state.trackKey) return render();
+  updateProgress(position);
 }, 1000);
+
+window.addEventListener("storage", event => {
+  if (event.key !== samplePlaybackKey || state.apiAvailable) return;
+  const previous = state.playback;
+  restoreSamplePlayback();
+  if (previous && !state.playback) {
+    state.selected = previous.album;
+    state.selectedSide = previous.sideIndex;
+  }
+  render();
+});
 
 function asUiAlbum(record) {
   const sides = record.sides?.length
@@ -299,6 +476,7 @@ function asUiAlbum(record) {
     format: record.format || "Vinyl",
     cover: record.coverUrl || albums[0].cover,
     colors: ["#23352e", "#df9f47"],
+    hydrated: Boolean(record.sides?.length),
     sides
   };
 }
@@ -317,8 +495,15 @@ async function checkApi() {
     if (records?.length) {
       const syncedAlbums = records.map(asUiAlbum);
       albums.splice(0, albums.length, ...syncedAlbums);
-      state.selected = syncedAlbums[0];
-      void hydrateSelectedRecord(syncedAlbums[0].serverId);
+      knownRecords.clear();
+      syncedAlbums.forEach(album => knownRecords.set(String(album.id), album));
+      // Sample records and their playback give way to the real collection and the server's state.
+      if (state.playback && !state.playback.album.serverId) {
+        state.playback = null;
+        localStorage.removeItem(samplePlaybackKey);
+      }
+      if (state.selected && !state.selected.serverId) state.selected = null;
+      connectPlaybackStream();
     }
     render();
     void loadStats();
@@ -330,30 +515,34 @@ async function checkApi() {
 async function hydrateSelectedRecord(serverId) {
   try {
     const response = await fetch(`api/collection/${serverId}`);
-    if (!response.ok) return;
-    const { record } = await response.json();
-    if (!record) return;
-    const hydrated = asUiAlbum(record);
-    const index = albums.findIndex(album => String(album.id) === String(serverId));
-    if (index >= 0) albums[index] = hydrated;
-    if (String(state.selected.id) === String(serverId)) {
-      state.selected = hydrated;
-      state.selectedSide = 0;
-      render();
+    const { record } = response.ok ? await response.json() : {};
+    if (record) {
+      const hydrated = rememberAlbum(asUiAlbum(record));
+      if (String(state.selected?.id) === String(serverId)) state.selected = hydrated;
+    } else if (String(state.selected?.id) === String(serverId)) {
+      state.toast = "This record’s tracklist could not be loaded.";
     }
   } catch {
-    // A collection card still works with its cached summary if release details cannot load.
+    if (String(state.selected?.id) === String(serverId)) state.toast = "This record’s tracklist could not be loaded.";
   }
+  if (String(state.loadingId) === String(serverId)) state.loadingId = null;
+  render();
+}
+
+// The record on the deck: the side being played, otherwise the loaded record, otherwise none.
+function deckAlbum() {
+  return state.playback?.album || state.selected;
 }
 
 function albumCard(album) {
-  return `<button class="album-card ${state.selected.id === album.id ? "is-selected" : ""}" data-album="${album.id}">
+  const onDeck = String(deckAlbum()?.id) === String(album.id);
+  return `<button class="album-card ${onDeck ? "is-selected" : ""}" data-album="${album.id}">
     <span class="album-art" style="--cover:url('${album.cover}'); --c1:${album.colors[0]}; --c2:${album.colors[1]}"></span>
     <span class="album-meta">
       <strong>${album.title}</strong>
       <small>${album.artist}</small>
     </span>
-    ${state.selected.id === album.id ? `<span class="card-check">${icon("check")}</span>` : ""}
+    ${onDeck ? `<span class="card-check">${icon("check")}</span>` : ""}
   </button>`;
 }
 
@@ -396,20 +585,117 @@ function mobileNavItem(page, label, iconName) {
   return `<button class="mobile-nav-item ${state.page === page ? "active" : ""}" data-page="${page}">${icon(iconName)}<span>${label}</span></button>`;
 }
 
+function searchMatches(query) {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return [];
+  return [...knownRecords.values()]
+    .filter(album => `${album.artist} ${album.title}`.toLowerCase().includes(needle))
+    .slice(0, 8);
+}
+
+function searchResultsMarkup() {
+  if (!state.homeQuery.trim()) return "";
+  return state.searchResults.map(album => `<li><button data-load="${escapeHtml(album.id)}"><span class="tiny-cover" style="--cover:url('${escapeHtml(album.cover)}')"></span><span><strong>${escapeHtml(album.title)}</strong><small>${escapeHtml(album.artist)}${album.year && album.year !== "—" ? ` · ${escapeHtml(album.year)}` : ""}</small></span>${icon("arrow")}</button></li>`).join("")
+    || `<li class="search-empty">No records match “${escapeHtml(state.homeQuery.trim())}”</li>`;
+}
+
+function emptyDeck() {
+  return `<section class="now-playing deck-empty">
+    <div class="playing-image-wrap" aria-hidden="true">
+      <div class="platter"><span></span></div>
+      <div class="tonearm"><i></i></div>
+    </div>
+    <div class="now-info">
+      <span class="status-pill is-idle"><i></i>Nothing on the turntable</span>
+      <h2>Pick a record to play</h2>
+      <p class="release-meta">Search your ${state.apiAvailable ? "Discogs collection" : "sample shelf"} to load a record onto the deck.</p>
+      <div class="deck-search">
+        <label class="search-box">${icon("search")}<input type="search" placeholder="Search artist or album" value="${escapeHtml(state.homeQuery)}" data-input="home-search" autocomplete="off" aria-controls="deck-results"></label>
+        <ol class="search-results" id="deck-results" data-search-results>${searchResultsMarkup()}</ol>
+      </div>
+    </div>
+  </section>`;
+}
+
+function queueMarkup(side, position) {
+  return `<div class="queue-panel">
+    <div class="queue-head"><span>${escapeHtml(side.name)} queue</span><small>${side.tracks.length} tracks</small></div>
+    <ol>
+      ${side.tracks.map((track, i) => {
+        const status = !position ? "" : i < position.index ? "played" : i === position.index ? "playing" : i === position.index + 1 ? "next" : "";
+        return `<li class="${status ? `is-${status}` : ""}"><span>${String(i + 1).padStart(2, "0")}</span><strong>${escapeHtml(track)}</strong><small>${status === "playing" ? "now" : status === "next" ? "next" : ""}</small></li>`;
+      }).join("")}
+    </ol>
+  </div>`;
+}
+
+function deckMarkup() {
+  const playback = state.playback;
+  const album = deckAlbum();
+  if (!album) return emptyDeck();
+
+  const sideIndex = playback ? playback.sideIndex : state.selectedSide;
+  const side = album.sides[sideIndex];
+  const position = playback ? playbackPosition(playback) : null;
+  const loading = !playback && String(state.loadingId) === String(album.id);
+  const deckClass = [playback ? "is-playing" : "is-loaded", state.justLoaded ? "just-loaded" : ""].join(" ");
+  const record = `<div class="playing-image-wrap">
+      <div class="platter"><span></span></div>
+      <div class="record-shadow"></div>
+      <div class="big-record ${playback ? "spinning" : ""}" style="--c1:${album.colors[0]};--c2:${album.colors[1]}"><span></span></div>
+      <span class="now-cover" style="--cover:url('${escapeHtml(album.cover)}')"></span>
+      <div class="tonearm"><i></i></div>
+    </div>`;
+  const heading = `<p class="eyebrow">${escapeHtml(album.artist)}</p>
+      <h2>${escapeHtml(album.title)}</h2>
+      <p class="release-meta">${escapeHtml(album.year)} · ${escapeHtml(album.format)} · ${escapeHtml(album.genre)}</p>`;
+
+  if (playback) {
+    const nextSide = album.sides[sideIndex + 1];
+    const comingNext = position.next
+      ? `<strong>${escapeHtml(position.next.title)}</strong>`
+      : `<strong>${nextSide ? `Flip to ${escapeHtml(nextSide.name)}` : "End of the record"}</strong>`;
+    return `<section class="now-playing ${deckClass}">
+      ${record}
+      <div class="now-info">
+        <span class="status-pill"><i></i>Now playing · ${escapeHtml(side.name)}</span>
+        ${heading}
+        <div class="track-now">
+          <p class="eyebrow">Track ${position.index + 1} of ${playback.tracks.length}</p>
+          <strong>${escapeHtml(position.track.title)}</strong>
+          <div class="track-progress" data-track-progress style="--progress:${(position.elapsed / position.length) * 100}%"><i></i></div>
+          <div class="track-time" data-track-time><span>${formatClock(position.elapsed)}</span><span>${formatClock(position.length)}</span></div>
+        </div>
+        <p class="coming-next"><span>Coming next</span>${comingNext}</p>
+        <button class="secondary-button" data-action="stop" ${playback.id || !playback.album.serverId ? "" : "disabled"}>${icon("close")}<span>${playback.id || !playback.album.serverId ? "Stop tracking" : "Saving…"}</span></button>
+      </div>
+      ${queueMarkup(side, position)}
+    </section>`;
+  }
+
+  return `<section class="now-playing ${deckClass}">
+    ${record}
+    <div class="now-info">
+      <span class="status-pill"><i></i>Ready to play</span>
+      ${heading}
+      <div class="side-selector" role="group" aria-label="Choose record side">
+        ${album.sides.map((item, index) => `<button class="${sideIndex === index ? "selected" : ""}" data-side="${index}" ${loading ? "disabled" : ""}><span>${escapeHtml(item.name)}</span><small>${item.length}</small></button>`).join("")}
+      </div>
+      <div class="deck-actions">
+        <button class="primary-button" data-action="track" ${loading ? "disabled" : ""}>${icon("play")}<span>${loading ? "Loading tracklist…" : `Play ${escapeHtml(side.name)}`}</span></button>
+        <button class="text-button" data-action="eject">Change record</button>
+      </div>
+      <p class="current-track">${icon("note")}<span>Starts with<strong>${escapeHtml(side.tracks[0] || "—")}</strong></span></p>
+    </div>
+    ${queueMarkup(side, null)}
+  </section>`;
+}
+
 function homePage() {
   const view = listeningView();
   const recent = view.history.slice(0, 3);
   const week = view.days.slice(-7);
   const weekMax = Math.max(...week.map(day => day.seconds), 1);
-  const nowPlaying = state.isPlaying && state.playing;
-  const current = nowPlaying ? currentTrack() : null;
-  const sameSide = nowPlaying && state.playing.album.id === state.selected.id && state.playing.side === state.selectedSide;
-  const selectedSide = state.selected.sides[state.selectedSide];
-  const trackNote = nowPlaying
-    ? current.finished
-      ? `${icon("check")}<span>Side finished — tap to stop tracking</span>`
-      : `<i class="pulse"></i><span>Now playing · ${current.index + 1} of ${current.total}<strong>${current.title}${state.playing.album.id === state.selected.id ? "" : ` — ${state.playing.album.title}`}</strong></span>`
-    : `${icon("note")}<span>Starts with<strong>${selectedSide.tracks[0] || "—"}</strong></span>`;
   return layout(`<div class="page home-page">
     <header class="page-head">
       <div>
@@ -419,32 +705,7 @@ function homePage() {
       <button class="sync-button" data-action="sync">${icon("sync")}<span>Sync collection</span></button>
     </header>
 
-    <section class="now-playing ${nowPlaying ? "is-playing" : ""}">
-      <div class="playing-image-wrap">
-        <div class="record-shadow"></div>
-        <div class="big-record ${nowPlaying ? "spinning" : ""}" style="--c1:${state.selected.colors[0]};--c2:${state.selected.colors[1]}"><span></span></div>
-        <span class="now-cover" style="--cover:url('${state.selected.cover}')"></span>
-      </div>
-      <div class="now-info">
-        <span class="status-pill"><i></i>${nowPlaying ? "Now playing" : "Ready to play"}</span>
-        <p class="eyebrow">${state.selected.artist}</p>
-        <h2>${state.selected.title}</h2>
-        <p class="release-meta">${state.selected.year} · ${state.selected.format} · ${state.selected.genre}</p>
-        <div class="side-selector" role="group" aria-label="Choose record side">
-          ${state.selected.sides.map((side, index) => `<button class="${state.selectedSide === index ? "selected" : ""}" data-side="${index}"><span>${side.name}</span><small>${side.length}</small></button>`).join("")}
-        </div>
-        <button class="primary-button" data-action="track">
-          ${icon(nowPlaying ? "note" : "play")}<span>${nowPlaying ? "Tracking this side" : `Start tracking ${state.selected.sides[state.selectedSide].name}`}</span>
-        </button>
-        <p class="current-track ${nowPlaying ? "is-live" : ""}">${trackNote}</p>
-      </div>
-      <div class="queue-panel">
-        <div class="queue-head"><span>${state.selected.sides[state.selectedSide].name} queue</span><small>${state.selected.sides[state.selectedSide].tracks.length} tracks</small></div>
-        <ol>
-          ${state.selected.sides[state.selectedSide].tracks.map((track, i) => `<li><span>${String(i + 1).padStart(2, "0")}</span><strong>${track}</strong><small>${sameSide && !current.finished && i === current.index ? "playing" : ""}</small></li>`).join("")}
-        </ol>
-      </div>
-    </section>
+    ${deckMarkup()}
 
     <section class="section-heading">
       <div><h2>Pick something from your shelf</h2><p>${state.apiAvailable ? `${view.collectionCount} records in your Discogs collection` : "Sample records until your Discogs collection is connected"}</p></div>
@@ -531,17 +792,137 @@ function settingsPage() {
 
 function render() {
   const pages = { home: homePage, collection: collectionPage, stats: statsPage, settings: settingsPage };
+  if (state.playback) state.trackKey = `${state.playback.id}:${playbackPosition(state.playback).index}`;
   app.innerHTML = pages[state.page]();
   attachEvents();
   if (state.toast) setTimeout(() => { state.toast = ""; render(); }, 3200);
 }
 
-function selectAlbum(id, navigate = false) {
-  state.selected = albums.find(album => String(album.id) === String(id)) || albums[0];
-  state.selectedSide = 0;
+// Put a record on the deck. While a side is playing the deck stays on that side.
+function loadRecord(id, navigate = false) {
+  const album = findAlbum(id);
+  if (!album) return;
   if (navigate) state.page = "home";
+  if (state.playback) {
+    state.toast = String(state.playback.album.id) === String(album.id)
+      ? `${state.playback.album.sides[state.playback.sideIndex].name} is already playing`
+      : "Stop the current side before changing records";
+    render();
+    return;
+  }
+  const changed = String(state.selected?.id) !== String(album.id);
+  state.selected = album;
+  if (changed) state.selectedSide = 0;
+  state.justLoaded = changed;
+  state.homeQuery = "";
+  state.searchResults = [];
+  const needsTracklist = album.serverId && !album.hydrated;
+  if (needsTracklist) state.loadingId = album.id;
   render();
-  if (state.selected.serverId) void hydrateSelectedRecord(state.selected.serverId);
+  if (changed) setTimeout(() => { state.justLoaded = false; }, 1200);
+  if (needsTracklist) void hydrateSelectedRecord(album.serverId);
+}
+
+let searchTimer = null;
+let searchSequence = 0;
+
+function showSearchResults() {
+  const list = document.querySelector("[data-search-results]");
+  if (!list) return;
+  list.innerHTML = searchResultsMarkup();
+  list.querySelectorAll("[data-load]").forEach(button => button.addEventListener("click", () => loadRecord(button.dataset.load)));
+}
+
+// Search the whole collection on the server when it is available, otherwise the records on hand.
+function searchDeck(query) {
+  state.homeQuery = query;
+  clearTimeout(searchTimer);
+  if (!query.trim() || !state.apiAvailable) {
+    state.searchResults = searchMatches(query);
+    showSearchResults();
+    return;
+  }
+  const sequence = ++searchSequence;
+  searchTimer = setTimeout(async () => {
+    try {
+      const response = await fetch(`api/collection?${new URLSearchParams({ q: query.trim(), limit: "8" })}`);
+      if (!response.ok) throw new Error("Search failed");
+      const { records } = await response.json();
+      if (sequence !== searchSequence) return;
+      state.searchResults = records.map(record => rememberAlbum(asUiAlbum(record)));
+    } catch {
+      if (sequence !== searchSequence) return;
+      state.searchResults = searchMatches(query);
+    }
+    showSearchResults();
+  }, 200);
+}
+
+async function startPlayback() {
+  const album = state.selected;
+  if (!album || state.playback) return;
+  const sideIndex = state.selectedSide;
+  const side = album.sides[sideIndex];
+  state.playback = plannedPlayback(album, sideIndex, now());
+  state.toast = `${side.name} is now being tracked`;
+
+  if (!album.serverId) {
+    state.history.unshift({ album, side: sideIndex, at: new Date().toISOString() });
+    localStorage.setItem("groove-history", JSON.stringify(state.history));
+    saveSamplePlayback();
+    render();
+    return;
+  }
+
+  state.pendingStart = true;
+  render();
+  try {
+    const response = await fetch("api/listens", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ collectionReleaseId: album.serverId, side: side.name.replace("Side ", "") })
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || "The server could not start this side.");
+    state.pendingStart = false;
+    state.playback = playbackFromListen(body.listen);
+    void loadStats();
+  } catch (error) {
+    state.pendingStart = false;
+    state.playback = null;
+    state.toast = error.message === "Failed to fetch" ? "The server is unreachable, so this side was not tracked." : error.message;
+  }
+  render();
+}
+
+async function stopPlayback() {
+  const playback = state.playback;
+  if (!playback) return;
+  state.playback = null;
+  state.selected = playback.album;
+  state.selectedSide = playback.sideIndex;
+  state.toast = "Tracking stopped — the play has been saved";
+
+  if (!playback.album.serverId) {
+    saveSamplePlayback();
+    render();
+    return;
+  }
+  render();
+  try {
+    const response = await fetch(`api/listens/${playback.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: "stopped" })
+    });
+    // 404 means the side had already finished or another tab stopped it.
+    if (!response.ok && response.status !== 404) throw new Error();
+    void loadStats();
+  } catch {
+    state.toast = "The server could not stop this side.";
+    await refreshPlayback();
+    render();
+  }
 }
 
 function attachEvents() {
@@ -549,48 +930,29 @@ function attachEvents() {
     state.page = button.dataset.page;
     render();
   }));
-  document.querySelectorAll("[data-album]").forEach(button => button.addEventListener("click", () => selectAlbum(button.dataset.album, state.page !== "home")));
+  document.querySelectorAll("[data-album]").forEach(button => button.addEventListener("click", () => loadRecord(button.dataset.album, state.page !== "home")));
+  document.querySelectorAll("[data-load]").forEach(button => button.addEventListener("click", () => loadRecord(button.dataset.load)));
   document.querySelectorAll("[data-side]").forEach(button => button.addEventListener("click", () => {
     state.selectedSide = Number(button.dataset.side);
     render();
   }));
+  document.querySelector("[data-input='home-search']")?.addEventListener("input", event => searchDeck(event.target.value));
+  document.querySelector("[data-input='home-search']")?.addEventListener("keydown", event => {
+    if (event.key === "Enter" && state.searchResults[0]) loadRecord(state.searchResults[0].id);
+    if (event.key === "Escape") {
+      event.target.value = "";
+      searchDeck("");
+    }
+  });
   document.querySelectorAll("[data-action]").forEach(button => button.addEventListener("click", async () => {
-    if (button.dataset.action === "track") {
-      state.isPlaying = !state.isPlaying;
-      if (state.isPlaying) {
-        state.playing = { album: state.selected, side: state.selectedSide, startedAt: Date.now() };
-        state.trackKey = "0:false";
-        const now = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-        state.history.unshift({ album: state.selected, side: state.selectedSide, startedAt: `Today, ${now}`, at: new Date().toISOString() });
-        localStorage.setItem("groove-history", JSON.stringify(state.history));
-        state.toast = `${state.selected.sides[state.selectedSide].name} is now being tracked`;
-        if (state.selected.serverId) {
-          const side = state.selected.sides[state.selectedSide].name.replace("Side ", "");
-          fetch("api/listens", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ collectionReleaseId: state.selected.serverId, side })
-          })
-            .then(response => response.ok ? response.json() : Promise.reject(new Error("Unable to save listen")))
-            .then(({ listen }) => { state.remoteListenId = listen.id; void loadStats(); })
-            .catch(() => {
-              state.toast = "Tracking locally — the server could not save this listen.";
-              render();
-            });
-        }
-      } else {
-        state.playing = null;
-        state.toast = "Tracking stopped — the play has been saved";
-        if (state.remoteListenId) {
-          fetch(`api/listens/${state.remoteListenId}`, {
-            method: "PATCH",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ status: "stopped" })
-          }).catch(() => {});
-          state.remoteListenId = null;
-        }
-      }
+    if (button.dataset.action === "track") await startPlayback();
+    if (button.dataset.action === "stop") await stopPlayback();
+    if (button.dataset.action === "eject") {
+      state.selected = null;
+      state.homeQuery = "";
+      state.searchResults = [];
       render();
+      document.querySelector("[data-input='home-search']")?.focus();
     }
     if (button.dataset.action === "sync") {
       button.classList.add("syncing");
@@ -643,6 +1005,7 @@ function attachEvents() {
   document.querySelector(".toggle")?.addEventListener("click", event => event.currentTarget.classList.toggle("on"));
 }
 
+restoreSamplePlayback();
 render();
 checkApi();
 

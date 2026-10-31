@@ -1,7 +1,11 @@
 import { db } from "./db.js";
 import { syncCollection } from "./collection.js";
+import { completeFinishedListens } from "./listens.js";
 
 try {
+  const completed = await completeFinishedListens();
+  if (completed) console.log(`Marked ${completed} finished ${completed === 1 ? "side" : "sides"} completed.`);
+
   const due = await db.query(
     `SELECT user_id FROM sync_settings
      WHERE next_sync_at <= now()

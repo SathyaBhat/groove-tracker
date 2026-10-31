@@ -8,8 +8,10 @@ The current front-end prototype includes:
 
 - a Discogs-connected collection experience, with album, artist, and genre search
 - side-by-side listening tracking and per-side track queues
-- a now-playing presentation designed for desktop, tablet, and phone
-- locally persisted play history and lightweight listening analytics
+- an empty turntable with a collection search on the home page; picking a record loads it onto the deck
+- now playing, track progress, and coming next while a side plays, designed for desktop, tablet, and phone
+- playback state held by the API and pushed to every open tab, so a refresh or a new tab shows the same side
+- play history and lightweight listening analytics
 - configurable daily, weekly, or monthly collection refresh preferences
 - Last.fm scrobble status in the listening flow
 
@@ -82,9 +84,13 @@ The stack joins the external `dokploy-network` and expects a Traefik `tailscale`
 | Load a release’s sides and tracks | `GET /api/collection/:id` |
 | Set background refresh cadence | `PATCH /api/settings/sync-frequency` |
 | Begin / stop a side play | `POST /api/listens`, `PATCH /api/listens/:id` |
+| Current playback | `GET /api/listens/current` |
+| Live playback updates (Server-Sent Events) | `GET /api/listens/stream` |
 
 Discogs tokens are encrypted before storage. The collection sync stores release summaries first, then fetches and caches a release’s tracklist when that record is selected. Starting a side creates a listening session and one pending scrobble job per track.
 
+The API owns playback: each user has at most one side playing, and starting a new side stops the previous one. When a side is stopped early, scrobble jobs for tracks that had not started yet are cancelled. Open tabs receive the full playback state over `/api/listens/stream` whenever a side starts or stops, and work out the current and next track from each track's start time. A side counts as completed once its expected end time passes. Without the API, sample-record playback is kept in `localStorage`.
+
 ## Scheduled collection refresh
 
-Run `npm run worker:sync` from your host’s scheduler every hour. It only syncs users whose selected daily, weekly, or monthly cadence is due. The worker leaves Last.fm jobs in the database for the forthcoming Last.fm worker.
+Run `npm run worker:sync` from your host’s scheduler every hour. It marks finished sides completed, then only syncs users whose selected daily, weekly, or monthly cadence is due. The worker leaves Last.fm jobs in the database for the forthcoming Last.fm worker.
