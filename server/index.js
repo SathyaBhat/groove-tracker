@@ -208,8 +208,8 @@ app.patch("/api/settings/sync-frequency", async request => {
 
 app.post("/api/listens", async (request, reply) => {
   const { collectionReleaseId, side, startedAt } = request.body || {};
-  if (!uuidPattern.test(collectionReleaseId || "") || !/^[A-D]$/.test(side || "")) {
-    return reply.code(400).send({ error: "collectionReleaseId and side (A-D) are required." });
+  if (!uuidPattern.test(collectionReleaseId || "") || !/^[A-Z]$/.test(side || "")) {
+    return reply.code(400).send({ error: "collectionReleaseId and side (A-Z) are required." });
   }
 
   const user = await localUser();

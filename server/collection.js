@@ -168,7 +168,9 @@ export async function hydrateRelease(userId, collectionReleaseId) {
 
 export function serializeRelease(release) {
   const tracklist = release.tracklist || [];
-  const sides = ["A", "B", "C", "D"]
+  // Box sets can run well past side D (e.g. A–H), so take side letters from the tracklist in order.
+  const sideLetters = [...new Set(flattenTracklist(tracklist).map(sideForTrack).filter(Boolean))];
+  const sides = sideLetters
     .map(side => {
       const tracks = tracksForSide(tracklist, side);
       const durationSeconds = tracks.reduce((total, track) => total + track.durationSeconds, 0);
