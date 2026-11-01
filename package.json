@@ -9,6 +9,7 @@
     "api:start": "node server/index.js",
     "db:migrate": "node server/migrate.js",
     "worker:sync": "node server/worker.js",
+    "backfill:durations": "node server/backfill-durations.js",
     "build": "vite build",
     "preview": "vite preview"
   },

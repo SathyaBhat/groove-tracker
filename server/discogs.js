@@ -108,3 +108,8 @@ export async function getRelease(credentials, releaseId) {
   const response = await discogsFetch(`${DISCOGS_API}/releases/${releaseId}`, credentials);
   return response.json();
 }
+
+export async function getMaster(credentials, masterId) {
+  const response = await discogsFetch(`${DISCOGS_API}/masters/${masterId}`, credentials);
+  return response.json();
+}

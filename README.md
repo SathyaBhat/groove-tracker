@@ -101,4 +101,15 @@ The API owns playback: each user has at most one side playing, and starting a ne
 
 ## Scheduled collection refresh
 
-Run `npm run worker:sync` from your host’s scheduler every hour. It marks finished sides completed, then only syncs users whose selected daily, weekly, or monthly cadence is due. The worker leaves Last.fm jobs in the database for the forthcoming Last.fm worker.
+Run `npm run worker:sync` from your host’s scheduler every hour. It marks finished sides completed, then only syncs users whose selected daily, weekly, or monthly cadence is due. After each successful sync it backfills missing track durations for that user (see below). The worker leaves Last.fm jobs in the database for the forthcoming Last.fm worker.
+
+## Backfill missing track durations
+
+Some Discogs pressings have no track durations, so their side lengths show as "—". The sync worker fills these in after every scheduled sync. To run it on demand:
+
+```sh
+npm run backfill:durations -- --dry-run   # report what would change
+npm run backfill:durations
+```
+
+The script finds cached tracklists with tracks that have no duration and fetches each release from Discogs again. Any tracks still missing a duration get one copied from the release's master, matched by title, or by order when both tracklists have the same number of tracks. Copied durations are marked `duration_source: "master"` in the cached tracklist. Records whose tracklist has not been fetched yet are skipped unless you pass `--include-unfetched`. Requests are spaced about one second apart to stay under the Discogs rate limit.

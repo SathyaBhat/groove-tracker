@@ -1,5 +1,6 @@
 import { db } from "./db.js";
 import { syncCollection } from "./collection.js";
+import { backfillDurations } from "./durations.js";
 import { completeFinishedListens } from "./listens.js";
 
 try {
@@ -18,6 +19,12 @@ try {
       console.log(`Synced ${result.releasesSeen} records for ${userId}.`);
     } catch (error) {
       console.error(`Sync failed for ${userId}: ${error.message}`);
+      continue;
+    }
+    try {
+      await backfillDurations(userId);
+    } catch (error) {
+      console.error(`Duration backfill failed for ${userId}: ${error.message}`);
     }
   }
 } finally {

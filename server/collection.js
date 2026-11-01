@@ -16,7 +16,7 @@ function mediaFormat(info) {
     .join(" / ") || "Vinyl";
 }
 
-function credentials(connection) {
+export function credentials(connection) {
   return {
     token: decrypt(connection.access_token),
     tokenSecret: decrypt(connection.access_token_secret)
@@ -35,7 +35,7 @@ export function sideForTrack(track) {
 }
 
 // Discogs nests the tracks of classical or multi-part releases under an index entry (sub_tracks).
-function flattenTracklist(tracklist) {
+export function flattenTracklist(tracklist) {
   return (tracklist || [])
     .flatMap(track => (track.sub_tracks?.length ? track.sub_tracks : [track]))
     .filter(track => track.type_ !== "heading");
