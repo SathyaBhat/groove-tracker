@@ -100,6 +100,7 @@ const icons = {
   arrow: `<svg viewBox="0 0 24 24"><path d="M5 12h14m-6-6 6 6-6 6"/></svg>`,
   check: `<svg viewBox="0 0 24 24"><path d="m5 12 4.5 4.5L19 7"/></svg>`,
   close: `<svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg>`,
+  sidebar: `<svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16m6-10-2 2 2 2"/></svg>`,
   play: `<svg viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5Z"/></svg>`,
   note: `<svg viewBox="0 0 24 24"><path d="M9 18V5l10-2v13M9 18a3 3 0 1 1-2-2.83M19 16a3 3 0 1 1-2-2.83"/></svg>`,
 };
@@ -123,6 +124,7 @@ const state = {
   syncFrequency: "Weekly",
   toast: "",
   history: JSON.parse(localStorage.getItem("groove-history") || "[]"),
+  sidebarCollapsed: localStorage.getItem("groove-sidebar-collapsed") === "true",
   apiAvailable: false,
   stats: null,
   discogs: { connected: false, username: null },
@@ -212,7 +214,8 @@ function listeningView() {
         cover: item.coverUrl,
         side: `Side ${item.side}`,
         length: formatSideLength(item.durationSeconds),
-        when: formatWhen(item.startedAt)
+        when: formatWhen(item.startedAt),
+        tracks: (item.tracks || []).map((track, index) => ({ title: track.title, position: track.position || `${item.side}${index + 1}` }))
       })),
       collectionCount: stats.collectionCount
     };
@@ -251,10 +254,40 @@ function listeningView() {
       cover: item.album.cover,
       side: item.album.sides[item.side].name,
       length: item.album.sides[item.side].length,
-      when: item.at ? formatWhen(item.at) : item.startedAt
+      when: item.at ? formatWhen(item.at) : item.startedAt,
+      tracks: item.album.sides[item.side].tracks.map((title, index) => ({
+        title,
+        position: `${item.album.sides[item.side].name.replace("Side ", "")}${index + 1}`
+      }))
     })),
     collectionCount: albums.length
   };
+}
+
+// Listening history grouped by record: consecutive sides of the same record form one session.
+function historyGroups(history) {
+  const groups = [];
+  for (const item of history) {
+    const last = groups[groups.length - 1];
+    if (last && String(last.id) === String(item.id)) {
+      last.sides.unshift(item);
+      last.when = item.when;
+      continue;
+    }
+    groups.push({ id: item.id, title: item.title, artist: item.artist, cover: item.cover, when: item.when, sides: [item] });
+  }
+  return groups;
+}
+
+function historyMarkup(history) {
+  return historyGroups(history).map(group => {
+    const tracks = group.sides.flatMap(side => side.tracks);
+    const sideNames = group.sides.map(side => side.side).join(" · ");
+    return `<article class="history-group">
+      <button class="history-row" data-album="${escapeHtml(group.id)}"><span class="tiny-cover" style="--cover:url('${escapeHtml(group.cover)}')"></span><span><strong>${escapeHtml(group.artist)} — ${escapeHtml(group.title)}</strong><small>${escapeHtml(sideNames)} · ${tracks.length} ${tracks.length === 1 ? "track" : "tracks"} · Scrobbles queued</small></span><time>${escapeHtml(group.when)}</time></button>
+      ${tracks.length ? `<ol class="history-tracks">${tracks.map(track => `<li><span>${escapeHtml(track.position)}</span><strong>${escapeHtml(track.title)}</strong></li>`).join("")}</ol>` : ""}
+    </article>`;
+  }).join("");
 }
 
 async function loadStats() {
@@ -547,22 +580,23 @@ function albumCard(album) {
 }
 
 function layout(content) {
-  return `<main class="shell">
+  return `<main class="shell ${state.sidebarCollapsed ? "sidebar-collapsed" : ""}">
     <aside class="sidebar">
-      <div class="brand">${icon("logo")}<span>groove tracker</span></div>
+      <button class="brand" data-page="home" aria-label="Groove Tracker home">${icon("logo")}<span>groove tracker</span></button>
       <nav class="nav" aria-label="Main navigation">
         ${navItem("home", "Home", "home")}
         ${navItem("collection", "My collection", "collection")}
         ${navItem("stats", "Your stats", "chart")}
       </nav>
       <div class="sidebar-footer">
-        <button class="mini-profile" data-action="profile"><span class="avatar">SB</span><span><strong>Sathya</strong><small>${state.stats?.collectionCount ?? albums.length} records</small></span>${icon("more")}</button>
-        <button class="settings-link" data-page="settings">${icon("settings")}Settings</button>
+        <button class="mini-profile" data-action="profile" ${state.sidebarCollapsed ? 'title="Sathya"' : ""}><span class="avatar">SB</span><span><strong>Sathya</strong><small>${state.stats?.collectionCount ?? albums.length} records</small></span>${icon("more")}</button>
+        <button class="settings-link ${state.page === "settings" ? "active" : ""}" data-page="settings" ${state.sidebarCollapsed ? 'title="Settings"' : ""}>${icon("settings")}<span>Settings</span></button>
+        <button class="settings-link sidebar-toggle" data-action="toggle-sidebar" aria-expanded="${!state.sidebarCollapsed}" ${state.sidebarCollapsed ? 'title="Expand sidebar" aria-label="Expand sidebar"' : ""}>${icon("sidebar")}<span>Collapse sidebar</span></button>
       </div>
     </aside>
     <section class="main-panel">
       <header class="mobile-header">
-        <div class="brand">${icon("logo")}<span>groove tracker</span></div>
+        <button class="brand" data-page="home" aria-label="Groove Tracker home">${icon("logo")}<span>groove tracker</span></button>
         <button class="avatar avatar-button" data-action="profile">SB</button>
       </header>
       ${content}
@@ -578,7 +612,7 @@ function layout(content) {
 }
 
 function navItem(page, label, iconName) {
-  return `<button class="nav-item ${state.page === page ? "active" : ""}" data-page="${page}">${icon(iconName)}<span>${label}</span></button>`;
+  return `<button class="nav-item ${state.page === page ? "active" : ""}" data-page="${page}" ${state.sidebarCollapsed ? `title="${label}"` : ""}>${icon(iconName)}<span>${label}</span></button>`;
 }
 
 function mobileNavItem(page, label, iconName) {
@@ -770,8 +804,8 @@ function statsPage() {
       <article class="chart-card"><div class="card-title"><div><h2>Listening rhythm</h2><p>Time played each day, last 14 days</p></div><span class="chart-total">${formatHours(total14)}</span></div><div class="bar-chart">${view.days.map((day, i) => `<span class="${day.seconds && i === peak ? "highlight" : ""}" style="--value:${Math.max(Math.round(day.seconds / max * 100), 3)}%"></span>`).join("")}</div><div class="chart-axis">${axis.map(label => `<span>${label}</span>`).join("")}</div></article>
       <article class="top-albums"><div class="card-title"><div><h2>On repeat</h2><p>Your most-played records</p></div></div>${view.topAlbums.map((album, i) => `<button data-album="${album.id}"><span class="rank">0${i + 1}</span><span class="tiny-cover" style="--cover:url('${album.cover}')"></span><span><strong>${album.title}</strong><small>${album.artist}</small></span><em>${album.sides} ${album.sides === 1 ? "side" : "sides"}</em></button>`).join("") || `<div class="empty-state">Your most-played records will show up here.</div>`}</article>
     </section>
-    <section class="history-card"><div class="card-title"><div><h2>Listening history</h2><p>Every side, carefully saved.</p></div></div>
-      ${view.history.map(item => `<div class="history-row"><span class="tiny-cover" style="--cover:url('${item.cover}')"></span><span><strong>${item.artist} — ${item.title}</strong><small>${item.side} · ${item.length} · Scrobble queued</small></span><time>${item.when}</time></div>`).join("") || `<div class="empty-state">No listens yet.</div>`}</section>
+    <section class="history-card"><div class="card-title"><div><h2>Listening history</h2><p>Every track, grouped by record.</p></div></div>
+      ${historyMarkup(view.history) || `<div class="empty-state">No listens yet.</div>`}</section>
   </div>`);
 }
 
@@ -974,6 +1008,11 @@ function attachEvents() {
     }
     if (button.dataset.action === "sort") {
       state.toast = "Sorted by recently added";
+      render();
+    }
+    if (button.dataset.action === "toggle-sidebar") {
+      state.sidebarCollapsed = !state.sidebarCollapsed;
+      localStorage.setItem("groove-sidebar-collapsed", String(state.sidebarCollapsed));
       render();
     }
     if (button.dataset.action === "profile") {

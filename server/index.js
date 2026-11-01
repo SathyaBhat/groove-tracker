@@ -308,7 +308,17 @@ app.get("/api/stats", async () => {
     ),
     db.query(
       `SELECT l.id, r.id AS "collectionReleaseId", r.artist, r.title, r.cover_url AS "coverUrl",
-              l.side, l.started_at AS "startedAt", ${sideSeconds}::int AS "durationSeconds"
+              l.side, l.status, l.started_at AS "startedAt", ${sideSeconds}::int AS "durationSeconds",
+              -- Only the tracks that had started before the side ended or was stopped.
+              COALESCE((
+                SELECT json_agg(json_build_object(
+                  'title', t.track->>'title',
+                  'position', t.track->>'position',
+                  'startsAt', t.track->>'startsAt'
+                ) ORDER BY t.ord)
+                FROM jsonb_array_elements(l.tracks) WITH ORDINALITY AS t(track, ord)
+                WHERE (t.track->>'startsAt')::timestamptz <= COALESCE(l.completed_at, now())
+              ), '[]'::json) AS tracks
        FROM listens l JOIN collection_releases r ON r.id = l.collection_release_id
        WHERE l.user_id = $1 ORDER BY l.started_at DESC LIMIT 20`,
       [user.id]
