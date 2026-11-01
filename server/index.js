@@ -15,6 +15,7 @@ import {
   serializeRelease,
   syncCollection
 } from "./collection.js";
+import { backfillDurations } from "./durations.js";
 import { activeListen, startListen, stopListen } from "./listens.js";
 import { onPlayback, publishPlayback } from "./events.js";
 
@@ -182,9 +183,22 @@ app.get("/api/collection/:collectionReleaseId", async request => {
   return { record: serializeRelease(release) };
 });
 
+// Users with a duration backfill in progress, so repeated syncs don't start overlapping runs.
+const backfillsRunning = new Set();
+
+function startBackfill(userId) {
+  if (backfillsRunning.has(userId)) return;
+  backfillsRunning.add(userId);
+  backfillDurations(userId)
+    .catch(error => app.log.error({ err: error, userId }, "Duration backfill failed"))
+    .finally(() => backfillsRunning.delete(userId));
+}
+
 app.post("/api/collection/sync", async (_request, reply) => {
   const user = await localUser();
   const result = await syncCollection(user.id);
+  // Backfilling makes throttled Discogs requests per record, so run it after responding.
+  startBackfill(user.id);
   return reply.code(202).send(result);
 });
 

@@ -105,7 +105,7 @@ Run `npm run worker:sync` from your host’s scheduler every hour. It marks fini
 
 ## Backfill missing track durations
 
-Some Discogs pressings have no track durations, so their side lengths show as "—". The sync worker fills these in after every scheduled sync. To run it on demand:
+Some Discogs pressings have no track durations, so their side lengths show as "—". The sync worker fills these in after every scheduled sync, and the API starts a backfill in the background after each `POST /api/collection/sync`. To run it on demand:
 
 ```sh
 npm run backfill:durations -- --dry-run   # report what would change
